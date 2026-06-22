@@ -77,6 +77,42 @@ cli = [
 [project.urls]
 Source = "https://github.com/google/tunix"
 
+# Local-only dev tooling for driving the marin iris TPU cluster from this repo
+# (submitting jobs with `uv run iris ...` and running the iris-dependent tests).
+# These live in a PEP 735 dependency-group, NOT in [project.optional-dependencies],
+# so they are NOT shipped in the published google-tunix wheel — they only affect
+# the local uv-managed dev environment. Install with `uv sync --group iris`.
+[dependency-groups]
+iris = [
+  "marin-iris",   # the `iris` CLI + client (job submission, cluster ops)
+  "marin-fray",   # shared cluster client utilities the iris CLI expects
+]
+# Convenience aggregate: editable tunix + its test deps + the iris tooling.
+dev = [
+  "marin-iris",
+  "marin-fray",
+  "pytest",
+  "pytest-xdist",
+  "gcsfs",
+  "chex",
+]
+
+[tool.uv]
+# marin-iris / marin-fray are published as nightly prereleases (0.2.x.dev*), so
+# resolution must be allowed to pick prereleases.
+prerelease = "allow"
+# google-tunix's pins and the marin nightly wheels disagree on a few transitive
+# deps; these overrides make the combined resolution converge. Mirrors the
+# marin-experiments configs that already run google-tunix + marin-iris together.
+override-dependencies = [
+  "omegaconf>=2.4.0.dev4",
+  "antlr4-python3-runtime==4.11",
+  "python-multipart>=0.0.22",
+  "wheel>=0.46.2",
+  "datasets>=3.1.0,<4.0.0",
+  "equinox>=0.11.10",
+]
+
 [build-system]
 requires = ["setuptools >= 77.0.3"]
 build-backend = "setuptools.build_meta"

@@ -13,6 +13,7 @@
 
 # virtualenv/venv directories
 /venv/
+/.venv/
 /bin/
 /include/
 /lib/
