@@ -144,6 +144,10 @@ class ModelConfig:
   rope_theta: int
   norm_eps: float
   use_tied_embedding: bool = False
+  # Optional Llama-3 RoPE frequency scaling (e.g. for marin Delphi). When set,
+  # must contain factor/low_freq_factor/high_freq_factor/
+  # original_max_position_embeddings; applied in apply_rope.
+  rope_scaling: dict[str, float] | None = None
   num_experts: int | None = None
   num_experts_per_tok: int | None = None
   shd_config: ShardingConfig = ShardingConfig.get_default_sharding()
@@ -366,15 +370,87 @@ class Embedder(nnx.Module):
     return jnp.dot(x, w.T)
 
 
+def _llama3_scale_inv_freq(
+    inv_freq: jnp.ndarray,
+    factor: float,
+    low_freq_factor: float,
+    high_freq_factor: float,
+    original_max_position_embeddings: int,
+) -> jnp.ndarray:
+  """Applies Llama-3 piecewise RoPE frequency scaling.
+
+  Mirrors HuggingFace ``_compute_llama3_parameters``: low-frequency (long
+  wavelength) components are divided by ``factor``, high-frequency components
+  are left unscaled, and a smooth interpolation is applied in between. The
+  thresholds are defined by WAVELENGTH (derived from
+  ``original_max_position_embeddings`` and the ``*_freq_factor`` values), so the
+  scaling is active independent of the runtime sequence length.
+
+  Args:
+    inv_freq: base inverse frequencies, shape [head_dim // 2].
+    factor: overall scaling factor for low-frequency components.
+    low_freq_factor: divides the original context to set the low-freq wavelength.
+    high_freq_factor: divides the original context to set the high-freq
+      wavelength.
+    original_max_position_embeddings: the pre-scaling training context length.
+
+  Returns:
+    The Llama-3 scaled inverse frequencies, shape [head_dim // 2].
+  """
+  low_freq_wavelen = original_max_position_embeddings / low_freq_factor
+  high_freq_wavelen = original_max_position_embeddings / high_freq_factor
+  wavelen = 2 * jnp.pi / inv_freq
+
+  inv_freq_llama = jnp.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+  smooth_factor = (
+      original_max_position_embeddings / wavelen - low_freq_factor
+  ) / (high_freq_factor - low_freq_factor)
+  smoothed_inv_freq = (
+      1 - smooth_factor
+  ) / factor * inv_freq + smooth_factor * inv_freq
+  is_medium_freq = jnp.logical_and(
+      wavelen <= low_freq_wavelen, wavelen >= high_freq_wavelen
+  )
+  return jnp.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+
+
 def apply_rope(
     inputs: jaxtyping.Array,  # [B, L]
     positions: jaxtyping.Array,  # [B, L]
     head_dim: int,
     rope_theta: int = 1_000_000,
+    rope_scaling: dict[str, float] | None = None,
 ) -> jaxtyping.Array:
-  """Applies RoPE."""
+  """Applies RoPE, optionally with Llama-3 frequency scaling.
+
+  Args:
+    inputs: query or key projections, shape [B, L, N, head_dim].
+    positions: absolute positions, shape [B, L].
+    head_dim: per-head dimension.
+    rope_theta: RoPE base frequency.
+    rope_scaling: optional Llama-3 scaling parameters. When provided it must
+      contain ``factor``, ``low_freq_factor``, ``high_freq_factor`` and
+      ``original_max_position_embeddings``; the inverse frequencies are then
+      transformed by :func:`_llama3_scale_inv_freq`. When ``None`` standard RoPE
+      is used.
+
+  Returns:
+    The rotary-embedded inputs, same shape and dtype as ``inputs``.
+  """
   fraction = 2 * jnp.arange(0, head_dim // 2, dtype=jnp.float32) / head_dim
   timescale = rope_theta**fraction
+
+  if rope_scaling is not None:
+    inv_freq = _llama3_scale_inv_freq(
+        1.0 / timescale,
+        factor=rope_scaling['factor'],
+        low_freq_factor=rope_scaling['low_freq_factor'],
+        high_freq_factor=rope_scaling['high_freq_factor'],
+        original_max_position_embeddings=rope_scaling[
+            'original_max_position_embeddings'
+        ],
+    )
+    timescale = 1.0 / inv_freq
 
   sinusoid_inp = (
       positions[..., jnp.newaxis] / timescale[jnp.newaxis, jnp.newaxis, :]
@@ -480,6 +556,8 @@ class Attention(nnx.Module):
     )
     self.n_rep = config.num_heads // config.num_kv_heads
     self.scale = self.head_dim**-0.5
+    self.rope_theta = config.rope_theta
+    self.rope_scaling = config.rope_scaling
 
   def block(
       self,
@@ -503,11 +581,15 @@ class Attention(nnx.Module):
         query_proj,
         segment_pos,
         head_dim=self.head_dim,
+        rope_theta=self.rope_theta,
+        rope_scaling=self.rope_scaling,
     )
     key_proj = apply_rope(
         key_proj,
         segment_pos,
         head_dim=self.head_dim,
+        rope_theta=self.rope_theta,
+        rope_scaling=self.rope_scaling,
     )
 
     if cache is not None:
