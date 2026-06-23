@@ -167,9 +167,7 @@ class LocalWeightTransfer:
     from `RLCluster.close()`.
   """
 
-  def __init__(
-      self, backend: LocalReshardBackend = LocalReshardBackend.AUTO
-  ):
+  def __init__(self, backend: LocalReshardBackend = LocalReshardBackend.AUTO):
     """Initializes the local weight transfer.
 
     Args:

@@ -177,9 +177,11 @@ class SelectReshardFnsTest(parameterized.TestCase):
         "b": NamedSharding(mesh_b, P()),
         "e": NamedSharding(mesh_b, P("fsdp")),
     }
-    real_import = __builtins__["__import__"] if isinstance(
-        __builtins__, dict
-    ) else __builtins__.__import__
+    real_import = (
+        __builtins__["__import__"]
+        if isinstance(__builtins__, dict)
+        else __builtins__.__import__
+    )
 
     def _blocked_import(name, *args, **kwargs):
       if name == "pathwaysutils" or name.startswith("pathwaysutils."):
@@ -254,7 +256,9 @@ class DisjointMeshReshardTest(parameterized.TestCase):
     """JAX_DEVICE selected explicitly works without any reshard_fns arg path."""
     mesh_a, mesh_b = _build_disjoint_meshes()
     source, host_arrays = _make_source_pytree(mesh_a)
-    target = {k: NamedSharding(mesh_b, v.sharding.spec) for k, v in source.items()}
+    target = {
+        k: NamedSharding(mesh_b, v.sharding.spec) for k, v in source.items()
+    }
     out = reshard.reshard_pytree(
         source,
         target,

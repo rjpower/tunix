@@ -56,9 +56,7 @@ class DeviceHostKeyNonPathwaysTest(parameterized.TestCase):
   def test_slice_index_is_included_when_present(self):
     # On multi-slice TPU (no Pathways) slice_index is exposed and groups hosts
     # by slice.
-    key = topology._device_host_key(
-        _FakeDevice(process_index=2, slice_index=3)
-    )
+    key = topology._device_host_key(_FakeDevice(process_index=2, slice_index=3))
     self.assertEqual(key, (3, 2))
 
   def test_same_slice_different_hosts(self):
