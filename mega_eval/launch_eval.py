@@ -46,7 +46,7 @@ from huggingface_hub import snapshot_download
 from mega_eval.eval.agent_loop import run_episode
 from mega_eval.eval.grade import grade_task
 from mega_eval.eval.model_serving import make_tunix_model_fn
-from mega_eval.eval.sandbox import GvisorContainerSandbox, build_image, remove_image
+from mega_eval.eval.sandbox import GvisorContainerSandbox, build_image, prune_ota_images, remove_image
 from mega_eval.eval.tb_tasks import load_tb_tasks
 from mega_eval.models.checkpoint import restore_sft_model
 from mega_eval.models.registry import get_model_spec
@@ -122,37 +122,39 @@ def main() -> None:
     print(f"[ota-eval] ({i+1}/{len(tasks)}) task={task.task_id}", flush=True)
     rec = {"task_id": task.task_id, "k": k_samples, "samples": [],
            "pass1": 0.0, "passk": False, "best_score": 0.0, "error": None}
+    records.append(rec)  # record up front so a mid-task crash can't drop the task
     build = build_image(task.environment_dir, task.image_tag)
     if build.exit_code != 0:
       rec["error"] = f"image build failed: {build.stderr[-500:]}"
       print(f"[ota-eval]   -> {json.dumps(rec)}", flush=True)
-      records.append(rec)
       continue
-    for s in range(k_samples):
-      sample = _one_episode(task)
-      rec["samples"].append(sample)
-      print(f"[ota-eval]   sample {s+1}/{k_samples} -> "
-            f"solved={sample['solved']} score={sample['score']:.3f} "
-            f"turns={sample['turns']} parse_fail={sample['parse_failures']}", flush=True)
-    solves = [bool(x["solved"]) for x in rec["samples"]]
-    scores = [float(x["score"]) for x in rec["samples"]]
-    rec["pass1"] = sum(solves) / max(len(solves), 1)  # mean solve over k
-    rec["passk"] = any(solves)
-    rec["best_score"] = max(scores) if scores else 0.0
-    rec["score_mean"] = sum(scores) / max(len(scores), 1)
-    rec["spread"] = 0.0 < rec["pass1"] < 1.0  # binary-solve spread (strict)
-    # The RL gate that actually matches the env reward: the env returns the
-    # CONTINUOUS grader score (rl/environment.py), so Dr.GRPO gets a usable
-    # advantage whenever the k scores VARY -- even with 0 full solves. A task
-    # where every sample scores the same (incl. all-zero) gives 0 advantage.
-    rec["score_spread"] = (max(scores) - min(scores) > 1e-9) if scores else False
-    print(f"[ota-eval]   = task pass1={rec['pass1']:.3f} passk={rec['passk']} "
-          f"score[min/mean/max]={min(scores):.3f}/{rec['score_mean']:.3f}/{rec['best_score']:.3f} "
-          f"score_spread={rec['score_spread']}", flush=True)
-    records.append(rec)
-    # Free the image now that this task's samples are graded: vfs doesn't share
-    # layers, so keeping every image blows a small disk. Bounds usage to ~1 image.
-    remove_image(task.image_tag)
+    try:
+      for s in range(k_samples):
+        sample = _one_episode(task)
+        rec["samples"].append(sample)
+        print(f"[ota-eval]   sample {s+1}/{k_samples} -> "
+              f"solved={sample['solved']} score={sample['score']:.3f} "
+              f"turns={sample['turns']} parse_fail={sample['parse_failures']}", flush=True)
+      solves = [bool(x["solved"]) for x in rec["samples"]]
+      scores = [float(x["score"]) for x in rec["samples"]]
+      rec["pass1"] = sum(solves) / max(len(solves), 1)  # mean solve over k
+      rec["passk"] = any(solves)
+      rec["best_score"] = max(scores) if scores else 0.0
+      rec["score_mean"] = sum(scores) / max(len(scores), 1)
+      rec["spread"] = 0.0 < rec["pass1"] < 1.0  # binary-solve spread (strict)
+      # The RL gate that actually matches the env reward: the env returns the
+      # CONTINUOUS grader score (rl/environment.py), so Dr.GRPO gets a usable
+      # advantage whenever the k scores VARY -- even with 0 full solves. A task
+      # where every sample scores the same (incl. all-zero) gives 0 advantage.
+      rec["score_spread"] = (max(scores) - min(scores) > 1e-9) if scores else False
+      print(f"[ota-eval]   = task pass1={rec['pass1']:.3f} passk={rec['passk']} "
+            f"score[min/mean/max]={min(scores):.3f}/{rec['score_mean']:.3f}/{rec['best_score']:.3f} "
+            f"score_spread={rec['score_spread']}", flush=True)
+    finally:
+      # Free the image now that this task's samples are graded (or on error):
+      # vfs doesn't share layers, so keeping every image blows a small disk.
+      # Bounds usage to ~1 image at a time.
+      remove_image(task.image_tag)
 
   n = len(records)
   # micro pass@1 = mean solve over ALL (task,sample); macro pass@k = tasks any-solved.
@@ -171,6 +173,11 @@ def main() -> None:
   print(f"[ota-eval] RL-TRAINABLE (continuous score varies across k): "
         f"{len(score_spread_tasks)} tasks {json.dumps(score_spread_tasks)}", flush=True)
   print(f"[ota-eval] PER_TASK_JSON {json.dumps(records)}", flush=True)
+  # Backstop the per-task removals: sweep any task image left resident by a crash
+  # between build and grade (best-effort; the iris task's vfs store dies with it).
+  pruned = prune_ota_images()
+  if pruned:
+    print(f"[ota-eval] cleanup: pruned {pruned} leftover task image(s)", flush=True)
 
 
 if __name__ == "__main__":

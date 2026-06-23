@@ -340,6 +340,41 @@ def remove_image(tag: str, *, timeout: float = 120.0) -> ExecResult:
   return _run(["docker", "rmi", "-f", tag], timeout=timeout)
 
 
+# All TB-dev task images we build share this tag prefix (see eval/tb_tasks.py:
+# ``image_tag=f"ota-tb/{task_id}:latest"``). A prefix-based sweep lets a job free
+# every image it built regardless of which tasks ran, as a backstop to the
+# per-task ``remove_image`` calls.
+_OTA_IMAGE_PREFIX = "ota-tb/"
+
+
+def prune_ota_images(*, prefix: str = _OTA_IMAGE_PREFIX, timeout: float = 300.0) -> int:
+  """Force-removes every locally-built TB task image (``<prefix>*``).
+
+  A belt-and-suspenders cleanup for the end of a run (or a ``finally``): the
+  per-task ``remove_image`` already bounds disk during the loop, but a crash
+  between build and removal -- or the RL path, which builds all task images up
+  front and reuses them across steps -- can leave images resident. dockerd's vfs
+  store is per-container and dies with the ephemeral iris task, so this only
+  matters to bound disk *within* a run; it never persists across jobs.
+
+  Returns the number of image tags removed. Best-effort: never raises (a cleanup
+  failure must not mask the real result), and a no-op if dockerd isn't up.
+  """
+  if shutil.which("docker") is None:
+    return 0
+  listed = _run(
+      ["docker", "images", "--filter", f"reference={prefix}*", "-q", "--no-trunc"],
+      timeout=30,
+  )
+  if listed.exit_code != 0:
+    return 0
+  ids = sorted({i for i in listed.stdout.split() if i})
+  if not ids:
+    return 0
+  _run(["docker", "rmi", "-f", *ids], timeout=timeout)
+  return len(ids)
+
+
 class LocalUnsafeSandbox:
   """Plain subprocess execution with NO isolation. Dev/testing only.
 

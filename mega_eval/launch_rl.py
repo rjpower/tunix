@@ -54,7 +54,7 @@ from tunix.rl.agentic.agentic_grpo_learner import GRPOConfig, GRPOLearner
 from tunix.rl.agentic.parser.chat_template_parser.parser import QwenChatTemplateParser
 from tunix.rl.rollout import base_rollout
 
-from mega_eval.eval.sandbox import build_image
+from mega_eval.eval.sandbox import build_image, prune_ota_images
 from mega_eval.eval.tb_tasks import load_tb_tasks
 from mega_eval.models.checkpoint import restore_sft_model
 from mega_eval.models.registry import get_model_spec
@@ -218,8 +218,15 @@ def main() -> None:
   )
 
   print(f"[ota-rl] training: {steps} steps x {prompts_per_batch} tasks x {num_generations} gens", flush=True)
-  learner.train(build_prompt_dataset(built, prompts_per_batch, steps))
-  print(f"[ota-rl] RL COMPLETE (ckpt={rl_ckpt_dir})", flush=True)
+  try:
+    learner.train(build_prompt_dataset(built, prompts_per_batch, steps))
+    print(f"[ota-rl] RL COMPLETE (ckpt={rl_ckpt_dir})", flush=True)
+  finally:
+    # RL builds every task image up front and reuses them across steps; free them
+    # at the end (or on failure) so a long run / retry doesn't accrete vfs disk.
+    pruned = prune_ota_images()
+    if pruned:
+      print(f"[ota-rl] cleanup: pruned {pruned} task image(s)", flush=True)
 
 
 if __name__ == "__main__":
