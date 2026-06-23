@@ -81,12 +81,12 @@ JAX_DEVICE_RESHARD_FACTORY: ReshardFactory = (  # pylint: disable=invalid-name
     reshard._get_reshard_fn_jax_device_put  # pylint: disable=protected-access
 )
 
-# AUTO order. Kept as a module constant so it is provably the same list the
-# historical `reshard_pytree` used inline.
-_AUTO_RESHARD_FACTORIES: list[ReshardFactory] = [
+# AUTO order. Kept as an immutable module constant (tuple) so it is provably the
+# same order the historical `reshard_pytree` used inline and cannot be mutated.
+_AUTO_RESHARD_FACTORIES: tuple[ReshardFactory, ...] = (
     PATHWAYS_RESHARD_FACTORY,
     JAX_DEVICE_RESHARD_FACTORY,
-]
+)
 
 
 def is_pathways_available() -> bool:

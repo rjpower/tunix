@@ -155,6 +155,7 @@ def _get_reshard_fn(
   Returns:
     A reshard function.
   """
+  last_exc: Exception | None = None
   for get_reshard_fn in get_reshard_fns:
     try:
       reshard_fn = get_reshard_fn(
@@ -162,12 +163,18 @@ def _get_reshard_fn(
           donate=donate,
           use_experimental_pre_reshard=use_experimental_pre_reshard,
       )
-    except (ImportError, EnvironmentError):
-      logging.debug('Could not support {get_reshard_fn=}.', exc_info=True)
+    except (ImportError, EnvironmentError) as e:
+      last_exc = e
+      logging.debug('Could not support %r.', get_reshard_fn, exc_info=True)
     else:
       return reshard_fn
 
-  raise ValueError('Could not find a reshard function from {get_reshard_fns=}.')
+  # Chain the last underlying capability error so an explicitly-requested backend
+  # (e.g. PATHWAYS without the proxy enabled) reports the real reason, not just a
+  # generic "no fn found".
+  raise ValueError(
+      f'Could not find a usable reshard function from {get_reshard_fns!r}.'
+  ) from last_exc
 
 
 def reshard_pytree(

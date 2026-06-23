@@ -252,8 +252,23 @@ class DisjointMeshReshardTest(parameterized.TestCase):
     jax.block_until_ready(out)
     _assert_resharded_onto_b(self, out, host_arrays, mesh_b)
 
-  def test_jax_device_backend_explicit_default_path(self):
-    """JAX_DEVICE selected explicitly works without any reshard_fns arg path."""
+  def test_default_reshard_fns_none_uses_auto(self):
+    """reshard_pytree() with no reshard_fns exercises the lazy-import AUTO path.
+
+    Off-Pathways, AUTO degrades to jax_device, so the disjoint-mesh reshard must
+    still land value-correct on mesh_B without passing reshard_fns explicitly.
+    """
+    mesh_a, mesh_b = _build_disjoint_meshes()
+    source, host_arrays = _make_source_pytree(mesh_a)
+    target = {
+        k: NamedSharding(mesh_b, v.sharding.spec) for k, v in source.items()
+    }
+    out = reshard.reshard_pytree(source, target)  # reshard_fns defaults to None
+    jax.block_until_ready(out)
+    _assert_resharded_onto_b(self, out, host_arrays, mesh_b)
+
+  def test_jax_device_backend_explicit(self):
+    """JAX_DEVICE selected via an explicit factory list works."""
     mesh_a, mesh_b = _build_disjoint_meshes()
     source, host_arrays = _make_source_pytree(mesh_a)
     target = {
