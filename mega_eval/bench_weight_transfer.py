@@ -120,24 +120,18 @@ def _build_params(mesh: Mesh, preset: str, dtype) -> dict:
   return params
 
 
-def _build_template(mesh: Mesh, preset: str, dtype) -> dict:
-  """A pytree with the same structure/shapes but on a (different) rollout mesh.
+def _build_template(mesh: Mesh, preset: str, dtype=jnp.bfloat16) -> dict:
+  """Rollout-side template on a (different) mesh, in the inference dtype.
 
-  Built directly as sharded zeros so it carries the rollout mesh/sharding the
-  transport must reshard onto.
+  Same structure/shapes/sharding as the trainer params but on the rollout
+  ``mesh`` and in ``dtype`` (bf16 by default -- inference runs bf16, and a
+  fully-replicated fp32 copy would OOM a 32GB v6e chip). The values are
+  placeholders: the transport overwrites every leaf, so only the leaf
+  structure / shape / dtype / sharding are load-bearing. Keeping the tp-sharded
+  layout means a 1/Ntp shard lands on each rollout device (no OOM) and the
+  transfer is a genuine cross-mesh reshard.
   """
-  return jax.tree.map(
-      lambda x: jax.device_put(
-          jnp.zeros(x.shape, dtype), NamedSharding(mesh, P(*_replicated(x)))
-      ),
-      _build_params(mesh, preset, dtype),
-  )
-
-
-def _replicated(_x):
-  # Rollout template: replicate everything (a common inference layout). The
-  # transport must still reshard from the trainer's tp-sharded layout to this.
-  return ()
+  return _build_params(mesh, preset, dtype)
 
 
 def _pytree_bytes(tree) -> int:
@@ -188,7 +182,7 @@ def _bench_nccl(
   dtype = jnp.float32
 
   params = _build_params(trainer_mesh, preset, dtype)
-  templates = [_build_template(m, preset, dtype) for m in rollout_meshes]
+  templates = [_build_template(m, preset, jnp.bfloat16) for m in rollout_meshes]
   model_bytes = _pytree_bytes(params)
   wire_bytes = model_bytes // 2 if convert_bf16 else model_bytes
 
@@ -254,7 +248,7 @@ def _bench_arrow_loopback(
   mesh = _mesh(jax.devices())
   dtype = jnp.float32
   params = _build_params(mesh, preset, dtype)
-  template = _build_template(mesh, preset, dtype)
+  template = _build_template(mesh, preset, jnp.bfloat16)
   model_bytes = _pytree_bytes(params)
   wire_bytes = model_bytes // 2 if convert_bf16 else model_bytes
 
@@ -357,7 +351,7 @@ def _bench_arrow_multihost(preset, n_sync, convert_bf16, nic_gbps, num_servers):
         "wire_gib": wire_bytes / _GIB,
     }
   else:
-    template = _build_template(local_mesh, preset, dtype)
+    template = _build_template(local_mesh, preset, jnp.bfloat16)
     client = arrow_flight.ArrowFlightClient(cfg, coordinator=coord)
     print(f"[arrow-mh p{pidx}/{pcount}] INFERENCE worker waiting for weights")
     gbps = []
@@ -393,7 +387,22 @@ def _bench_arrow_multihost(preset, n_sync, convert_bf16, nic_gbps, num_servers):
     }
 
 
+def _maybe_init_distributed():
+  """Bring up jax.distributed on multi-host TPU before any backend call.
+
+  Guarded on ``PJRT_DEVICE==TPU`` (the iris TPU signal -- ``JAX_NUM_PROCESSES``
+  is empty on iris) so a single-process GPU/CPU run never blocks on a
+  coordinator. The Arrow Flight multi-host coordinator (`JaxKvCoordinator`)
+  needs this; the single-process GPU NCCL bench does not.
+  """
+  if os.environ.get("PJRT_DEVICE") == "TPU":
+    from mega_eval.training import common  # pylint: disable=g-import-not-at-top
+
+    common.init_distributed()
+
+
 def main():
+  _maybe_init_distributed()
   mode = _env("BENCH_MODE", "nccl")
   preset = _env("MODEL_PRESET", "tiny")
   n_clients = int(_env("N_CLIENTS", "4"))
