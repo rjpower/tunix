@@ -74,10 +74,10 @@ class LocalReshardBackend(enum.Enum):
 # Named, documented references to the local reshard backend factories. These
 # live in `reshard.py` (so the model-load path can keep importing them there),
 # and are re-exported here so callers have a single, documented registry.
-PATHWAYS_RESHARD_FACTORY: ReshardFactory = (
+PATHWAYS_RESHARD_FACTORY: ReshardFactory = (  # pylint: disable=invalid-name
     reshard._get_reshard_fn_pathwaysutils  # pylint: disable=protected-access
 )
-JAX_DEVICE_RESHARD_FACTORY: ReshardFactory = (
+JAX_DEVICE_RESHARD_FACTORY: ReshardFactory = (  # pylint: disable=invalid-name
     reshard._get_reshard_fn_jax_device_put  # pylint: disable=protected-access
 )
 
