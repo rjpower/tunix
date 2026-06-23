@@ -17,7 +17,7 @@
 CPU-only and deterministic. Run with 8 simulated CPU devices::
 
     XLA_FLAGS="--xla_force_host_platform_device_count=8" JAX_PLATFORMS=cpu \
-      .venv/bin/python -m pytest tunix/rl/weight_transfer_test.py -q
+      .venv/bin/python -m pytest tests/rl/weight_transfer_test.py -q
 
 The disjoint-mesh reshard test ports PATH1 of scratchpad/spike_reshard.py: it
 builds two disjoint sub-meshes (devices[0:4] vs [4:8]), reshards a pytree from
