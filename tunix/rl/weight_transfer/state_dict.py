@@ -33,8 +33,6 @@ sides as long as both flatten the same pytree structure (the trainer's params
 and the rollout worker's template share structure).
 """
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -47,18 +45,22 @@ def flat_keys(tree: PyTree) -> list[str]:
   return [jax.tree_util.keystr(path) for path, _ in items]
 
 
-@partial(jax.jit, static_argnames=("convert_to_bfloat16",))
-def _cast_and_flatten(params: PyTree, convert_to_bfloat16: bool) -> PyTree:
-  """Casts floats to bf16 (optional) and reshapes every leaf to 1-D, on device.
+def _cast_bf16(params: PyTree, convert_to_bfloat16: bool) -> PyTree:
+  """Casts floating leaves to bf16 (optional). Elementwise only.
 
-  Doing this inside one jit means the subsequent ``device_get`` already moves
-  bf16 (half the bytes) in the leaves' transfer-ready 1-D layout.
+  IMPORTANT: this is intentionally *not* jit'd and does *not* reshape on device.
+  A device-side ``reshape(-1)`` of a sharded tensor compiles an all-gather; on
+  multi-host TPU a jit confined to one host's local-device mesh (a subset of the
+  global topology) makes XLA's collective lowering reference devices on other
+  hosts and crash (RET_CHECK ``device_id < kMaxDeviceCount``). An elementwise
+  ``astype`` has no cross-device dependency, so it lowers per-shard and is safe
+  on a sub-global mesh; the reshape happens on host (see `flatten_for_transfer`).
   """
 
   def f(x):
     if convert_to_bfloat16 and jnp.issubdtype(x.dtype, jnp.floating):
-      x = x.astype(jnp.bfloat16)
-    return x.reshape(-1)
+      return x.astype(jnp.bfloat16)
+    return x
 
   return jax.tree.map(f, params)
 
@@ -67,6 +69,11 @@ def flatten_for_transfer(
     params: PyTree, *, convert_to_bfloat16: bool = True
 ) -> tuple[list[str], dict[str, np.ndarray]]:
   """Flattens ``params`` to host-resident 1-D arrays keyed by leaf keypath.
+
+  The bf16 cast happens on device (elementwise, collective-free); the array is
+  then ``device_get``-assembled to host from its local shards, and reshaped to
+  1-D *on host* (free numpy view). Doing the reshape on host avoids an on-device
+  all-gather that breaks multi-host TPU lowering.
 
   Args:
     params: The parameter pytree to serialize (flax/nnx leaves).
@@ -77,15 +84,15 @@ def flatten_for_transfer(
     ``np.ndarray`` (the leaf's bytes; dtype carries the bf16 cast if applied).
     ``ordered_keys`` preserves leaf order for stable iteration.
   """
-  flat_tree = _cast_and_flatten(params, convert_to_bfloat16)
-  host_tree = jax.device_get(flat_tree)
+  cast_tree = _cast_bf16(params, convert_to_bfloat16)
+  host_tree = jax.device_get(cast_tree)
   items, _ = jax.tree_util.tree_flatten_with_path(host_tree)
   keys: list[str] = []
   flat: dict[str, np.ndarray] = {}
   for path, value in items:
     key = jax.tree_util.keystr(path)
     keys.append(key)
-    flat[key] = np.ascontiguousarray(value)
+    flat[key] = np.ascontiguousarray(np.asarray(value).reshape(-1))
   return keys, flat
 
 
@@ -116,11 +123,16 @@ def restore_from_flat(flat: dict[str, np.ndarray], template: PyTree) -> PyTree:
       raise KeyError(f"Transferred state is missing parameter {key!r}.")
     value = np.asarray(flat[key]).reshape(jnp.shape(tmpl_leaf))
     target_dtype = getattr(tmpl_leaf, "dtype", value.dtype)
+    if np.dtype(value.dtype) != jnp.dtype(target_dtype):
+      value = value.astype(target_dtype)  # cast on host, not on device
     sharding = getattr(tmpl_leaf, "sharding", None)
-    arr = jnp.asarray(value, dtype=target_dtype)
+    # device_put a host array straight to the target sharding: jax scatters the
+    # shards directly (no full-tensor staging on one device, and no on-device
+    # collective -- both matter on multi-host TPU).
     if sharding is not None:
-      arr = jax.device_put(arr, sharding)
-    out_leaves.append(arr)
+      out_leaves.append(jax.device_put(value, sharding))
+    else:
+      out_leaves.append(jax.device_put(value))
   return jax.tree_util.tree_unflatten(treedef, out_leaves)
 
 
