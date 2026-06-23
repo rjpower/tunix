@@ -18,7 +18,6 @@ from concurrent import futures
 import functools
 # Keep this import for google internal usage.
 import math  # pylint: disable=unused-import
-import os
 import threading
 import time
 from typing import Any, Callable
@@ -28,6 +27,7 @@ import jax
 import jaxtyping
 from flax import nnx
 from tunix.rl import utils
+from tunix.utils import env_utils
 
 # TODO(tsbao): move this to util
 def callback_on_ready(
@@ -87,7 +87,8 @@ def _get_reshard_fn_pathwaysutils(
     )
     raise
   else:
-    if 'proxy' not in os.getenv('JAX_PLATFORMS', ''):
+    # Single source of truth for the 'proxy' in JAX_PLATFORMS capability.
+    if not env_utils.is_pathways_proxy_backend():
       raise EnvironmentError(
           'Pathways proxy is not available. Make sure you have enabled Pathways'
           ' proxy as jax backend, e.g. os.environ["JAX_PLATFORMS"] = "proxy".'

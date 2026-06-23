@@ -43,4 +43,21 @@ def is_pathways_initialized():
   except ImportError:
     return False
 
+
+def is_pathways_proxy_backend():
+  """Checks whether the Pathways proxy is selected as the JAX backend.
+
+  This is the single source of truth for the ``'proxy' in JAX_PLATFORMS``
+  predicate: it is the capability that gates the Pathways reshard backend and
+  the Pathways persistence-API checkpoint path. It is intentionally distinct
+  from `is_pathways_initialized()`, which asks pathwaysutils whether a Pathways
+  backend is in use; this one only inspects the requested JAX backend env, which
+  is what those call sites historically branched on.
+
+  Returns:
+    True if ``JAX_PLATFORMS`` requests the Pathways proxy backend, else False.
+  """
+  return 'proxy' in os.getenv('JAX_PLATFORMS', '')
+
+
 SGLANG_JAX_TP_AXIS_NAME = os.getenv('SGLANG_JAX_TP_AXIS_NAME', 'tensor')

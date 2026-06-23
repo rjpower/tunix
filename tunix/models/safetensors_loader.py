@@ -479,6 +479,10 @@ def load_and_create_model(
   if model_class_kwargs is None:
     model_class_kwargs = {}
 
+  # The Pathways branch here is a semantic capability gate routed through the
+  # single source of truth (env_utils.is_pathways_initialized()), not a blind
+  # stub: the optimized loader path is unsupported under Pathways, so it must
+  # fall back to the original loader. Behavior off-Pathways is unchanged.
   if mode == 'auto':
     if env_utils.is_internal_env() or env_utils.is_pathways_initialized():
       mode = 'original'
