@@ -61,6 +61,17 @@ docs = [
 prod = [
   "jax[tpu]>=0.6.0,!=0.7.2", # Jax 0.7.2 has performance regression on OSS
 ]
+# GPU (CUDA 13) extra for running tunix off-GCP on NVIDIA clusters (e.g. the
+# CoreWeave H100 cluster cw-us-east-02a). Mutually exclusive with `prod`
+# (jax[tpu]) — see [tool.uv] conflicts below. Minimal JAX+NCCL set: enough for
+# the pure-JAX rollout path (vanilla/sglang_jax) and NCCL weight sync; torch /
+# vLLM / flash-attn GPU deps are added later when the torch-vLLM-GPU path lands.
+gpu = [
+  "jax[cuda13]==0.10.0",
+  "nvidia-cublas>=13.2.0.9; sys_platform == 'linux'",
+  # Preserve the CoreWeave H100 all-to-all guard under CUDA 13.
+  "nvidia-nccl-cu13>=2.28.3; sys_platform == 'linux'",
+]
 dev = [
   # Manully install vLLM & tpu-inferece, which depends on jax[tpu]==0.7.2
 ]
@@ -104,6 +115,12 @@ dev = [
 # marin-iris / marin-fray are published as nightly prereleases (0.2.x.dev*), so
 # resolution must be allowed to pick prereleases.
 prerelease = "allow"
+# jax[tpu] (prod) and jax[cuda13] (gpu) ship incompatible jaxlib/PJRT plugins;
+# declare them mutually exclusive so uv forks the lock and rejects installing
+# both together. Submit TPU jobs with `--extra prod`, GPU jobs with `--extra gpu`.
+conflicts = [
+  [{ extra = "prod" }, { extra = "gpu" }],
+]
 # google-tunix's pins and the marin nightly wheels disagree on a few transitive
 # deps; these overrides make the combined resolution converge. Mirrors the
 # marin-experiments configs that already run google-tunix + marin-iris together.
