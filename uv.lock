@@ -1536,6 +1536,7 @@ gpu = [
 ]
 mega = [
     { name = "gcsfs" },
+    { name = "pyarrow" },
     { name = "wandb" },
 ]
 prod = [
@@ -1594,6 +1595,7 @@ requires-dist = [
     { name = "orbax-checkpoint", specifier = ">=0.12.0" },
     { name = "perfetto" },
     { name = "pillow" },
+    { name = "pyarrow", marker = "extra == 'mega'", specifier = ">=14.0.0" },
     { name = "pylatexenc" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "pytest-xdist", marker = "extra == 'test'" },

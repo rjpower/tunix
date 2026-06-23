@@ -91,6 +91,10 @@ cli = [
 mega = [
   "gcsfs",
   "wandb",
+  # Arrow Flight weight-transfer transport (tunix.rl.weight_transfer.arrow_flight)
+  # and the mega_eval data-mixture streamer both use pyarrow; the PyPI wheel
+  # ships the `pyarrow.flight` gRPC component we need.
+  "pyarrow>=14.0.0",
 ]
 
 [project.urls]
