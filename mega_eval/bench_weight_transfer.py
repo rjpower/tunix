@@ -316,7 +316,15 @@ def _bench_arrow_loopback(
 
 
 def _bench_arrow_multihost(preset, n_sync, convert_bf16, nic_gbps, num_servers):
-  """Process 0 serves; every other process pulls. Real cross-NIC transfer."""
+  """Process 0 serves continuously; every other process pulls (cross-NIC).
+
+  Runs for a fixed wall-clock window (SERVE_SECONDS) instead of a fixed count,
+  then ALL processes meet at one ``sync_global_devices`` barrier before exit so
+  jax.distributed shuts down in lockstep (otherwise the trainer and inference
+  processes hit the implicit shutdown barrier at different times and it times
+  out). ``n_sync`` caps how many timed fetches each worker records.
+  """
+  from jax.experimental import multihost_utils  # pylint: disable=g-import-not-at-top
   from tunix.rl.weight_transfer import arrow_flight  # pylint: disable=g-import-not-at-top
 
   pidx = jax.process_index()
@@ -324,6 +332,7 @@ def _bench_arrow_multihost(preset, n_sync, convert_bf16, nic_gbps, num_servers):
   is_trainer = pidx == 0
   local_mesh = _mesh(jax.local_devices())
   dtype = jnp.float32
+  serve_seconds = float(_env("SERVE_SECONDS", "60"))
 
   cfg = base.WeightTransferConfig(
       mode=base.WeightTransferMode.ARROW_FLIGHT,
@@ -331,6 +340,7 @@ def _bench_arrow_multihost(preset, n_sync, convert_bf16, nic_gbps, num_servers):
       num_flight_servers=num_servers,
   )
   coord = coordinator_lib.JaxKvCoordinator(cfg.coordinator_key)
+  result = {"mode": "arrow_multihost", "process": pidx, "pcount": pcount}
 
   if is_trainer:
     params = _build_params(local_mesh, preset, dtype)
@@ -339,60 +349,76 @@ def _bench_arrow_multihost(preset, n_sync, convert_bf16, nic_gbps, num_servers):
     server = arrow_flight.ArrowFlightServer(cfg, coordinator=coord)
     print(
         f"[arrow-mh p{pidx}/{pcount}] TRAINER serving"
-        f" model={model_bytes/_GIB:.3f}GiB"
-        f" wire={wire_bytes/_GIB:.3f}GiB flight_servers={len(server._flight_servers)}"  # pylint: disable=protected-access
+        f" model={model_bytes/_GIB:.3f}GiB wire={wire_bytes/_GIB:.3f}GiB"
+        f" flight_servers={len(server._flight_servers)}"  # pylint: disable=protected-access
+        f" inference_workers={pcount-1} window={serve_seconds:.0f}s"
     )
-    for r in range(n_sync + 1):
-      server.serve_weights(r + 1, params)
-      time.sleep(2.0)  # let clients drain before re-serving
-    time.sleep(10.0)
+    # Continuously publish fresh weight_ids so pulling workers always have
+    # something new to fetch; re-serving the same params is cheap on the wire.
+    wid = 0
+    t_end = time.time() + serve_seconds
+    while time.time() < t_end:
+      wid += 1
+      server.serve_weights(wid, params)
+      time.sleep(0.5)
     sm = server.get_metrics()
     print(
-        f"[arrow-mh p{pidx}] server"
+        f"[arrow-mh p{pidx}] server serves={wid}"
         f" serialize_mibps={sm.serialize_mib_per_second:.0f}"
-        f" transfers={sm.successful_transfers}"
+        f" materialize_mibps={sm.materialize_mib_per_second:.0f}"
     )
+    result.update(
+        role="trainer",
+        wire_gib=wire_bytes / _GIB,
+        serves=wid,
+        serialize_mibps=sm.serialize_mib_per_second,
+    )
+    multihost_utils.sync_global_devices("arrow_bench_done")
     server.cleanup()
-    return {
-        "mode": "arrow_multihost",
-        "role": "trainer",
-        "wire_gib": wire_bytes / _GIB,
-    }
+    print("BENCH_RESULT_JSON " + json.dumps(result, default=float))
+    return result
   else:
     template = _build_template(local_mesh, preset, jnp.bfloat16)
     client = arrow_flight.ArrowFlightClient(cfg, coordinator=coord)
-    print(f"[arrow-mh p{pidx}/{pcount}] INFERENCE worker waiting for weights")
+    print(f"[arrow-mh p{pidx}/{pcount}] INFERENCE worker pulling")
     gbps = []
-    seen = 0
-    deadline = time.time() + 60 * (n_sync + 2)
-    while seen < n_sync and time.time() < deadline:
+    last = -999
+    t_end = time.time() + serve_seconds
+    while time.time() < t_end and len(gbps) < n_sync:
       upd = client.receive_weights(template)
-      if upd is None:
-        time.sleep(0.2)
+      if upd is None or upd.weight_id == last:
+        time.sleep(0.05)
         continue
+      last = upd.weight_id
       cm = client.get_metrics()
       g = cm.receive_bytes / _GIB / cm.fetch_time if cm.fetch_time else 0
       gbps.append(g)
-      seen += 1
       print(
-          f"[arrow-mh p{pidx}] recv"
-          f" weight_id={upd.weight_id} bytes={cm.receive_bytes/_GIB:.3f}GiB"
-          f" fetch={cm.fetch_time:.2f}s reshard={cm.reshard_time:.2f}s"
-          f" fetch_gbps={g:.2f} nic%={100*g/nic_gbps:.0f}"
+          f"[arrow-mh p{pidx}] recv weight_id={upd.weight_id}"
+          f" bytes={cm.receive_bytes/_GIB:.3f}GiB fetch={cm.fetch_time:.2f}s"
+          f" reshard={cm.reshard_time:.2f}s fetch_gbps={g:.2f}"
+          f" nic%={100*g/nic_gbps:.0f}"
       )
     med = statistics.median(gbps) if gbps else 0.0
+    best = max(gbps) if gbps else 0.0
     print(
-        f"[arrow-mh p{pidx}] RESULT"
-        f" median_fetch_gbps={med:.2f} nic%={100*med/nic_gbps:.0f}"
+        f"[arrow-mh p{pidx}] RESULT fetches={len(gbps)}"
+        f" median_fetch_gbps={med:.2f} best_gbps={best:.2f}"
+        f" nic%={100*med/nic_gbps:.0f}"
     )
+    result.update(
+        role="inference",
+        fetches=len(gbps),
+        median_fetch_gbps=med,
+        best_fetch_gbps=best,
+        nic_pct=100 * med / nic_gbps,
+    )
+    # Barrier BEFORE cleanup so all processes (incl. still-serving trainer) exit
+    # together; otherwise jax.distributed's shutdown barrier times out.
+    multihost_utils.sync_global_devices("arrow_bench_done")
     client.cleanup()
-    return {
-        "mode": "arrow_multihost",
-        "role": "inference",
-        "process": pidx,
-        "median_fetch_gbps": med,
-        "nic_pct": 100 * med / nic_gbps,
-    }
+    print("BENCH_RESULT_JSON " + json.dumps(result, default=float))
+    return result
 
 
 def _maybe_init_distributed():
