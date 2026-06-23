@@ -84,6 +84,14 @@ test = [
 cli = [
   "tensorflow",
 ]
+# Model-track ("mega_eval") runtime deps for iris jobs: gcsfs so orbax can
+# read/write gs:// checkpoints, wandb (import-gated on WANDB_PROJECT) for curves.
+# Platform-agnostic; combine with the accelerator extra, e.g. `--extra prod
+# --extra mega` (TPU) or `--extra gpu --extra mega` (GPU).
+mega = [
+  "gcsfs",
+  "wandb",
+]
 
 [project.urls]
 Source = "https://github.com/google/tunix"
