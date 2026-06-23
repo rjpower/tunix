@@ -461,3 +461,64 @@ three `--region`s on every TPU submit; CPU-check (`JAX_PLATFORMS=cpu`) before yo
 spend a TPU; pass `top_p`; clip grads; fp32 actor params;
 `jax.distributed.initialize()` first on multi-host; `remat=NONE` to sample; prove
 `pass@k > pass@1 > 0` before RL; re-`uv lock` if stale.
+
+---
+
+## 11. Running tunix on GPU (CoreWeave H100 via iris `cw-us-east-02a`)
+
+tunix runs off-GCP on NVIDIA H100s through iris's CoreWeave cluster. **Verified
+end-to-end:** `marin_smoke.py` ran a real tunix Qwen3-0.6B forward on an H100
+(`kind='NVIDIA H100 80GB HBM3'`, jax 0.10.0/cuda13, `logits (1, 8, 151936)`, SUCCESS).
+
+### 11.1 One-time setup
+- **`gpu` optional-dependency group** (in `pyproject.toml`): `jax[cuda13]==0.10.0`,
+  `nvidia-cublas`, `nvidia-nccl-cu13`. It is **mutually exclusive with `prod`**
+  (`jax[tpu]`) via a `[tool.uv] conflicts` block — `uv` forks the lock. Submit TPU jobs
+  with `--extra prod`, GPU jobs with `--extra gpu`. Re-`uv lock` after editing it.
+- **Local CLI must reach the k8s controller:** the iris dep-group pulls
+  `marin-iris[controller]` (the `kubernetes` client). Without it, `cluster status` raises
+  `Install iris[controller] to use CloudK8sService`. Also needs `~/.kube/coreweave-iris-gpu`
+  + `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` in env (already present on this box).
+- Prove reachability first: `uv run iris --cluster=cw-us-east-02a cluster status`
+  (controller `Healthy: True`). NB: this cluster is **Pod-per-task k8s** (no Iris worker
+  daemons/autoscaler), so `cluster status` legitimately shows `Workers: 0/0` while jobs
+  still dispatch as pods onto the static 32×H100 NodePool.
+
+### 11.2 Submit pattern
+```bash
+uv run iris --cluster=cw-us-east-02a job run --no-wait \
+  --cpu 8 --memory 64GB --gpu H100x1 --enable-extra-resources --extra gpu \
+  --max-retries 1 --job-name my-gpu-job -- python my_entry.py
+```
+- `--gpu H100xN` requests N GPUs (e.g. `H100x8` for a full node); `--enable-extra-resources`
+  is required (same gate as TPU). **No `--region` flags** (single-region CoreWeave).
+- Full node: `--gpu H100x8 --cpu 32 --memory 512GB`. Multi-node uses the SDK
+  (`replicas=N`, `ports=["jax"]`, `coscheduling(group_by="leafgroup")`).
+- Data: CoreWeave **cannot read `gs://` for JAX IO** — it's wired to **R2 `s3://marin-na/…`**
+  (pods auto-get `AWS_*`/`FSSPEC_S3`). Stream HF datasets/weights on the worker; mirror
+  checkpoints to R2. NCCL uses `NCCL_SOCKET_IFNAME=enp157s0np0` (set in cluster config).
+
+### 11.3 Weight transfer / reshard on GPU
+The de-Pathways `tunix.rl.weight_transfer` backend registry selects the reshard fn by
+capability (AUTO → pathways-if-proxy else `jax_device`). On GPU there is no proxy, so the
+**`jax_device`** backend (plain `jax.device_put` cross-mesh reshard, XLA collectives = NCCL)
+is used. Colocated RL (ACTOR==ROLLOUT, or same-host disjoint meshes) uses all GPUs by
+construction (XLA collectives) — no rank-0 fold. **Verified on 8×H100
+(single node):** `reshard_pytree` moved a pytree across disjoint chip meshes
+[0:4]→[4:8] with values + physical placement correct (`OVERALL=PASS`), same as the
+TPU spike. Cross-node GPU reshard rides NCCL (untested here; the multi-node colocated
+path uses one `jax.distributed` world over `replicas=N`).
+
+### 11.4 Multi-host init guard (TPU and GPU)
+iris keys TPU multi-host off `PJRT_DEVICE=TPU`, **not** `JAX_NUM_PROCESSES` (which iris
+leaves empty) — so `marin_smoke.py`'s `JAX_NUM_PROCESSES>1` guard is a no-op on iris
+multi-host. Guard `jax.distributed.initialize()` on `PJRT_DEVICE`/`JAX_PLATFORMS startswith
+tpu` (TPU) or the GPU multi-host rendezvous env. A single v6e-8 marin slice can come back as
+1 host × 8 chips; use v6e-16 for a true 4-host test.
+
+### 11.5 Off-Pathways cross-host reshard caveat (TPU)
+Off-Pathways, **same-host** disjoint-mesh reshard is production-safe, but **cross-host**
+disjoint-mesh `device_put` returns correct values yet SIGSEGVs on teardown in XLA's
+cross-host receive notifier (v6e/jax 0.10.2). Keep trainer/rollout meshes on the same
+host(s) for colocated TPU RL; a different-host topology needs a real transport (Arrow/NCCL/
+remote control plane). On GPU this rides NCCL (not XLA TPU cross-host) — verify separately.
