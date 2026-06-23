@@ -84,12 +84,15 @@ Source = "https://github.com/google/tunix"
 # the local uv-managed dev environment. Install with `uv sync --group iris`.
 [dependency-groups]
 iris = [
-  "marin-iris",   # the `iris` CLI + client (job submission, cluster ops)
+  # [controller] pulls the `kubernetes` client needed to reach k8s-backed
+  # clusters (e.g. the CoreWeave GPU cluster `cw-us-east-02a`); the TPU `marin`
+  # cluster works without it but the CW CloudK8sService raises without it.
+  "marin-iris[controller]",   # the `iris` CLI + client (job submission, cluster ops)
   "marin-fray",   # shared cluster client utilities the iris CLI expects
 ]
 # Convenience aggregate: editable tunix + its test deps + the iris tooling.
 dev = [
-  "marin-iris",
+  "marin-iris[controller]",
   "marin-fray",
   "pytest",
   "pytest-xdist",

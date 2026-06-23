@@ -280,8 +280,8 @@ name = "array-record"
 version = "0.8.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "absl-py" },
-    { name = "etils", extra = ["epath"] },
+    { name = "absl-py", marker = "sys_platform != 'win32'" },
+    { name = "etils", extra = ["epath"], marker = "sys_platform != 'win32'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/44/e0/90048c75afdbb7e49526fee93f7e113986565a0b36b7c779eb35f745ec7e/array_record-0.8.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:8a0caee17d2583638391fb9f90c9c12a43f9665576f18ec3604ba49d62bd2dcc", size = 3988901, upload-time = "2025-11-13T16:15:29.35Z" },
@@ -937,6 +937,15 @@ wheels = [
 ]
 
 [[package]]
+name = "durationpy"
+version = "0.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9d/a4/e44218c2b394e31a6dd0d6b095c4e1f32d0be54c2a4b250032d717647bab/durationpy-0.10.tar.gz", hash = "sha256:1fa6893409a6e739c9c72334fc65cca1f355dbdd93405d30f726deb5bde42fba", size = 3335, upload-time = "2025-05-17T13:52:37.26Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b0/0d/9feae160378a3553fa9a339b0e9c1a048e147a4127210e286ef18b730f03/durationpy-0.10-py3-none-any.whl", hash = "sha256:3b41e1b601234296b4fb368338fdcd3e13e0b4fb5b67345948f4f2bf9868b286", size = 3922, upload-time = "2025-05-17T13:52:36.463Z" },
+]
+
+[[package]]
 name = "einops"
 version = "0.8.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1526,16 +1535,16 @@ dev = [
     { name = "gcsfs" },
     { name = "marin-fray", version = "0.2.20.dev202606180959", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "marin-fray", version = "0.2.24.dev202606221125", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "marin-iris", version = "0.2.20.dev202606180959", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "marin-iris", version = "0.2.24.dev202606221125", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "marin-iris", version = "0.2.20.dev202606180959", source = { registry = "https://pypi.org/simple" }, extra = ["controller"], marker = "python_full_version < '3.12'" },
+    { name = "marin-iris", version = "0.2.24.dev202606221125", source = { registry = "https://pypi.org/simple" }, extra = ["controller"], marker = "python_full_version >= '3.12'" },
     { name = "pytest" },
     { name = "pytest-xdist" },
 ]
 iris = [
     { name = "marin-fray", version = "0.2.20.dev202606180959", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "marin-fray", version = "0.2.24.dev202606221125", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "marin-iris", version = "0.2.20.dev202606180959", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "marin-iris", version = "0.2.24.dev202606221125", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "marin-iris", version = "0.2.20.dev202606180959", source = { registry = "https://pypi.org/simple" }, extra = ["controller"], marker = "python_full_version < '3.12'" },
+    { name = "marin-iris", version = "0.2.24.dev202606221125", source = { registry = "https://pypi.org/simple" }, extra = ["controller"], marker = "python_full_version >= '3.12'" },
 ]
 
 [package.metadata]
@@ -1589,13 +1598,13 @@ dev = [
     { name = "chex" },
     { name = "gcsfs" },
     { name = "marin-fray" },
-    { name = "marin-iris" },
+    { name = "marin-iris", extras = ["controller"] },
     { name = "pytest" },
     { name = "pytest-xdist" },
 ]
 iris = [
     { name = "marin-fray" },
-    { name = "marin-iris" },
+    { name = "marin-iris", extras = ["controller"] },
 ]
 
 [[package]]
@@ -2379,6 +2388,26 @@ wheels = [
 ]
 
 [[package]]
+name = "kubernetes"
+version = "35.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "certifi" },
+    { name = "durationpy" },
+    { name = "python-dateutil" },
+    { name = "pyyaml" },
+    { name = "requests" },
+    { name = "requests-oauthlib" },
+    { name = "six" },
+    { name = "urllib3" },
+    { name = "websocket-client" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2c/8f/85bf51ad4150f64e8c665daf0d9dfe9787ae92005efb9a4d1cba592bd79d/kubernetes-35.0.0.tar.gz", hash = "sha256:3d00d344944239821458b9efd484d6df9f011da367ecb155dadf9513f05f09ee", size = 1094642, upload-time = "2026-01-16T01:05:27.76Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0c/70/05b685ea2dffcb2adbf3cdcea5d8865b7bc66f67249084cf845012a0ff13/kubernetes-35.0.0-py2.py3-none-any.whl", hash = "sha256:39e2b33b46e5834ef6c3985ebfe2047ab39135d41de51ce7641a7ca5b372a13d", size = 2017602, upload-time = "2026-01-16T01:05:25.991Z" },
+]
+
+[[package]]
 name = "libclang"
 version = "18.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2629,6 +2658,13 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/45/88/fff54b397c5d6cf68d77df657861c5f2cc684a02d6271b332d8cee1c5b67/marin_iris-0.2.20.dev202606180959-py3-none-any.whl", hash = "sha256:a0ba5e5424f33a07209e15aafcbbd257ad2eaed32488facd1d5b7418632ced9a", size = 791790, upload-time = "2026-06-18T10:00:42.692Z" },
 ]
 
+[package.optional-dependencies]
+controller = [
+    { name = "duckdb", marker = "python_full_version < '3.12'" },
+    { name = "kubernetes", marker = "python_full_version < '3.12'" },
+    { name = "pyarrow", marker = "python_full_version < '3.12'" },
+]
+
 [[package]]
 name = "marin-iris"
 version = "0.2.24.dev202606221125"
@@ -2672,6 +2708,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/8b/a9/5a1b35eb49cd4c0d00a22900ed3192eb78a952a8d57b226ab2d6932bbd9a/marin_iris-0.2.24.dev202606221125.tar.gz", hash = "sha256:2100b8ec4907fcafdfe376d1c9f9258057e6b5debf39e4af3fb3622d3860418b", size = 681095, upload-time = "2026-06-22T11:26:46.113Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ef/b6/982e1d02c83453cdff050a1f92ee6433c1db0ec854f5a7aa1a8881fa8eba/marin_iris-0.2.24.dev202606221125-py3-none-any.whl", hash = "sha256:94aceb0f874ea7f0633a18f56cdf273bcd9fb3fdd1b0e9078bd93d0be1417d69", size = 807947, upload-time = "2026-06-22T11:26:35.982Z" },
+]
+
+[package.optional-dependencies]
+controller = [
+    { name = "kubernetes", marker = "python_full_version >= '3.12'" },
 ]
 
 [[package]]
@@ -3648,7 +3689,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess" },
+    { name = "ptyprocess", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [
@@ -5985,6 +6026,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/49/b4/51fe890511f0f242d07cb1ebe6a5b6db417262b9d2568b460347c57d95cc/wcwidth-0.8.1.tar.gz", hash = "sha256:faf5b4a5366a72dc49cad48cdf21f52bdf63bdda995178e483ba247ff79089b9", size = 1466072, upload-time = "2026-06-08T05:57:23.146Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bd/6e/95b0e537de1f4d4301f76f944642c6da50d1511cc7b3d64dc418a66c7509/wcwidth-0.8.1-py3-none-any.whl", hash = "sha256:f453740b1e4a4f3291faa37944c555d71056c4da08d59809b307ef4feba695c8", size = 323092, upload-time = "2026-06-08T05:57:21.413Z" },
+]
+
+[[package]]
+name = "websocket-client"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/41/aa4bf9664e4cda14c3b39865b12251e8e7d239f4cd0e3cc1b6c2ccde25c1/websocket_client-1.9.0.tar.gz", hash = "sha256:9e813624b6eb619999a97dc7958469217c3176312b3a16a4bd1bc7e08a46ec98", size = 70576, upload-time = "2025-10-07T21:16:36.495Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/34/db/b10e48aa8fff7407e67470363eac595018441cf32d5e1001567a7aeba5d2/websocket_client-1.9.0-py3-none-any.whl", hash = "sha256:af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef", size = 82616, upload-time = "2025-10-07T21:16:34.951Z" },
 ]
 
 [[package]]
