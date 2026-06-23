@@ -292,11 +292,17 @@ _REAL_PRESETS = {
 }
 
 
-def _build_real(mesh: Mesh, preset: str):
+def _build_real(mesh: Mesh, preset: str, remat=None):
   """Loads a real Qwen3 + tokenizer (downloads from HF) onto ``mesh``.
 
   Used on GPU (iris). ``mega_eval.models.registry`` maps the friendly preset to
   a ModelSpec whose ``load_model`` is mega_eval.models.qwen3_loader.load_qwen3.
+
+  ``remat`` (a ``qwen3.model.RematConfig``, or None) enables gradient
+  checkpointing -- pass ``BLOCK``/``DECODER`` for a TRAINING model to fit long
+  sequences in the backward pass. Leave None (=> ``RematConfig.NONE``) for a
+  rollout/inference model, since the sampler mutating the KV cache trips remat's
+  trace level. Disaggregation makes this safe: the trainer never samples.
   """
   from huggingface_hub import snapshot_download  # pylint: disable=g-import-not-at-top
   from mega_eval.models.registry import get_model_spec  # pylint: disable=g-import-not-at-top
@@ -304,16 +310,17 @@ def _build_real(mesh: Mesh, preset: str):
   spec = get_model_spec(_REAL_PRESETS[preset])
   model_dir = snapshot_download(spec.repo)
   # bf16 params for inference (a replicated fp32 8B copy per worker would OOM).
-  model = spec.load_model(model_dir, mesh=mesh, dtype=jnp.bfloat16)
+  kw = {"remat": remat} if remat is not None else {}
+  model = spec.load_model(model_dir, mesh=mesh, dtype=jnp.bfloat16, **kw)
   tokenizer = spec.load_tokenizer(model_dir)
   return model, tokenizer, model.config
 
 
-def _load_on_mesh(mesh: Mesh, preset: str):
+def _load_on_mesh(mesh: Mesh, preset: str, remat=None):
   if preset == "tiny":
     return _build_tiny(mesh)
   if preset in _REAL_PRESETS:
-    return _build_real(mesh, preset)
+    return _build_real(mesh, preset, remat=remat)
   raise ValueError(
       f"Unknown MODEL_PRESET={preset!r}; "
       f"known: ['tiny', {', '.join(repr(k) for k in _REAL_PRESETS)}]."

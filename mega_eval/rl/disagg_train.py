@@ -55,17 +55,26 @@ def build_optimizer(model, learning_rate, max_grad_norm=1.0):
 
 def build_train_example(
     prompt_ids, completion_ids, rewards, num_generations, advantage_estimator,
-    pad_id,
+    pad_id, completion_mask=None,
 ):
   """Assemble a `TrainExample` (ref/old logps None for Dr.GRPO beta=0, iter=1).
 
   prompt_ids: [B*G, P] left-padded; completion_ids: [B*G, C] right-padded;
   rewards: [B*G] flat, grouped contiguously by prompt (G per prompt).
+
+  ``completion_mask``: pass None for the single-turn case (derived as
+  ``completion_ids != pad_id`` -- every generated token is trained on). For the
+  AGENTIC multi-turn case pass the explicit assistant mask (1=model-generated,
+  0=env observation), so the loss trains ONLY on the policy's own tokens and not
+  on the injected tool outputs (which are non-pad but must not get a gradient).
   """
   prompt_ids = jnp.asarray(prompt_ids)
   completion_ids = jnp.asarray(completion_ids)
   prompt_mask = (prompt_ids != pad_id)
-  completion_mask = (completion_ids != pad_id).astype(jnp.int32)
+  if completion_mask is None:
+    completion_mask = (completion_ids != pad_id).astype(jnp.int32)
+  else:
+    completion_mask = jnp.asarray(completion_mask).astype(jnp.int32)
   adv_fn = function_registry.get_advantage_estimator(advantage_estimator)
   advantages = jnp.asarray(
       np.asarray(adv_fn(np.asarray(rewards), num_generations), dtype=np.float32)
