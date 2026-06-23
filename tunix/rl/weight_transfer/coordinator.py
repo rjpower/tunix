@@ -120,14 +120,21 @@ class JaxKvCoordinator(Coordinator):
     return state.client
 
   def publish(self, server_info: ServerInfo) -> None:
+    # The jax KV store is insert-only by default (InsertKeyValue ->
+    # ALREADY_EXISTS on the second serve); ``allow_overwrite=True`` makes both
+    # the versioned record and the mutable /latest pointer re-publishable so the
+    # trainer can serve repeatedly. Write the versioned record first, then
+    # advance /latest, so a client reading /latest always finds a written record.
     payload = _encode(server_info).decode("utf-8")
-    # Write the versioned record first, then advance the /latest pointer, so a
-    # client that reads /latest always finds a fully-written record.
     self._client.key_value_set(
-        f"{self._prefix}/v/{server_info.weight_id}", payload
+        f"{self._prefix}/v/{server_info.weight_id}",
+        payload,
+        allow_overwrite=True,
     )
     self._client.key_value_set(
-        f"{self._prefix}/latest", str(server_info.weight_id)
+        f"{self._prefix}/latest",
+        str(server_info.weight_id),
+        allow_overwrite=True,
     )
 
   def lookup(self) -> ServerInfo | None:
@@ -140,11 +147,11 @@ class JaxKvCoordinator(Coordinator):
     return _decode(record)
 
   def _try_get(self, key: str) -> str | None:
-    """Non-blocking-ish get: short timeout, None if the key isn't set yet."""
+    """Non-blocking get: returns the value, or None if the key isn't set yet."""
     try:
-      # blocking_key_value_get takes a timeout in ms; use a small one so a
-      # missing key returns quickly instead of hanging the poll.
-      return self._client.blocking_key_value_get(key, 1_000)
+      # key_value_try_get returns immediately (raises if unset), unlike
+      # blocking_key_value_get which would burn the poll on a timeout.
+      return self._client.key_value_try_get(key)
     except Exception:  # pylint: disable=broad-except
       logging.debug("KV get miss for %s", key, exc_info=True)
       return None

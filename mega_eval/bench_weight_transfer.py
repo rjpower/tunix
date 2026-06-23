@@ -383,8 +383,11 @@ def _bench_arrow_multihost(preset, n_sync, convert_bf16, nic_gbps, num_servers):
     print(f"[arrow-mh p{pidx}/{pcount}] INFERENCE worker pulling")
     gbps = []
     last = -999
+    # Pull for the whole window (not just n_sync) so inference and the trainer
+    # reach the final barrier at ~the same time (a large skew would time the
+    # shutdown barrier out). n_sync only bounds how many we print verbosely.
     t_end = time.time() + serve_seconds
-    while time.time() < t_end and len(gbps) < n_sync:
+    while time.time() < t_end:
       upd = client.receive_weights(template)
       if upd is None or upd.weight_id == last:
         time.sleep(0.05)
@@ -392,7 +395,10 @@ def _bench_arrow_multihost(preset, n_sync, convert_bf16, nic_gbps, num_servers):
       last = upd.weight_id
       cm = client.get_metrics()
       g = cm.receive_bytes / _GIB / cm.fetch_time if cm.fetch_time else 0
-      gbps.append(g)
+      if len(gbps) < 500:
+        gbps.append(g)
+      if len(gbps) > n_sync:
+        continue
       print(
           f"[arrow-mh p{pidx}] recv weight_id={upd.weight_id}"
           f" bytes={cm.receive_bytes/_GIB:.3f}GiB fetch={cm.fetch_time:.2f}s"
