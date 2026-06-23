@@ -15,6 +15,14 @@ Config via env:
   * ``SFT_STEPS`` (2000), ``BATCH_SIZE`` (8), ``LR`` (1e-5).
   * ``MAX_SEQ_LEN`` (8192), ``SEED`` (0), ``TP`` (1; set 2 on v6e-16 if OOM).
   * ``DATA_LIMIT`` (unset = all ~15.2k traces; set small for a smoke).
+  * ``MIXTURE`` -- name of a registered multi-dataset blend
+    (``swe_heavy`` | ``ota_only``); enables weighted multi-corpus SFT.
+  * ``SFT_MIXTURE`` -- a JSON list of ``{repo_id, weight, format, ...}`` entries;
+    an inline mixture spec that overrides ``MIXTURE``. (See
+    ``agent_data/mixtures.sources_from_json``.) When either is set, ``DATA_LIMIT``
+    is interpreted as a per-source cap; unset both for the single-corpus path.
+  * ``PER_SOURCE_LIMIT`` -- explicit per-source row cap for a mixture (overrides
+    the ``DATA_LIMIT`` fallback); small for a smoke.
   * ``CKPT_DIR`` (./checkpoints/<model>-agent-sft).
   * ``EVAL_TOKENS`` (384).
   * ``REMAT`` (decoder | block | none) -- activation rematerialization (decoder
@@ -47,6 +55,7 @@ from huggingface_hub import snapshot_download
 from tunix.generate import sampler as sampler_lib
 from tunix.models.qwen3 import model as qm
 
+from mega_eval.agent_data.mixtures import resolve_mixture
 from mega_eval.models.registry import get_model_spec
 from mega_eval.training.agent_sft import resolve_chatml_ids, run_agent_sft
 from mega_eval.training.common import build_mesh, init_distributed, metrics_logging_options
@@ -103,6 +112,18 @@ def main() -> None:
   data_limit = os.environ.get("DATA_LIMIT")
   data_limit = int(data_limit) if data_limit else None
   eval_tokens = int(os.environ.get("EVAL_TOKENS", "384"))
+
+  # Multi-dataset weighted blend (DATA_PLAN.md). SFT_MIXTURE (inline JSON) wins
+  # over MIXTURE (a registry name); neither set => single-corpus path below.
+  mixture_json = os.environ.get("SFT_MIXTURE")
+  mixture_name = os.environ.get("MIXTURE")
+  sources = None
+  per_source_limit = None
+  if mixture_json or mixture_name:
+    sources = resolve_mixture(mixture_json=mixture_json, mixture_name=mixture_name)
+    psl = os.environ.get("PER_SOURCE_LIMIT") or os.environ.get("DATA_LIMIT")
+    per_source_limit = int(psl) if psl else None
+    data_limit = None  # DATA_LIMIT becomes the per-source cap for a blend
   remat = {
       "decoder": qm.RematConfig.DECODER,
       "block": qm.RematConfig.BLOCK,
@@ -122,11 +143,16 @@ def main() -> None:
   model_dir = os.environ.get("AGENT_MODEL_DIR") or f"./{model_spec.name}"
   checkpoint_dir = os.environ.get("CKPT_DIR") or f"./checkpoints/{model_spec.name}-agent-sft"
 
+  mixture_desc = (
+      f"json[{len(sources)} sources]" if mixture_json
+      else (mixture_name if mixture_name else "single:ota-v1")
+  )
   print(f"[ota-sft] jax {jax.__version__} devices={jax.devices()}", flush=True)
   print(
       f"[ota-sft] model={model_spec.name} repo={model_spec.repo} steps={steps} "
       f"bs={batch_size} lr={learning_rate} max_seq_len={max_seq_len} tp={tp} "
-      f"data_limit={data_limit} ckpt={checkpoint_dir}",
+      f"data_limit={data_limit} mixture={mixture_desc} "
+      f"per_source_limit={per_source_limit} ckpt={checkpoint_dir}",
       flush=True,
   )
 
@@ -172,6 +198,7 @@ def main() -> None:
           "stage": "sft", "model": model_spec.name, "steps": steps,
           "batch_size": batch_size, "lr": learning_rate, "max_seq_len": max_seq_len,
           "tp": tp, "remat": os.environ.get("REMAT", "decoder"), "flash": use_flash,
+          "mixture": mixture_desc,
       },
   )
   model = run_agent_sft(
@@ -183,6 +210,8 @@ def main() -> None:
       max_seq_len=max_seq_len,
       seed=seed,
       limit=data_limit,
+      sources=sources,
+      per_source_limit=per_source_limit,
       checkpoint_dir=checkpoint_dir,
       metrics_options=metrics,
   )

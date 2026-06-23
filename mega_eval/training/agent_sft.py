@@ -33,6 +33,7 @@ import orbax.checkpoint as ocp
 from tunix.sft.peft_trainer import PeftTrainer, TrainingConfig
 
 from mega_eval.agent_data.agent_traces import load_agent_traces
+from mega_eval.agent_data.mixtures import DatasetSource, interleave_sources
 from mega_eval.training.common import clipped_adamw, sft_model_input_fn
 
 
@@ -131,13 +132,89 @@ def encode_agent_conversation(
   return input_tokens, loss_mask, pad_mask
 
 
-class _AgentSFTSource(grain.RandomAccessDataSource):
+def _collect_encoded_rows(
+    tokenizer,
+    examples: Iterable[dict[str, Any]],
+    n: int,
+    seed: int,
+    max_seq_len: int,
+    *,
+    scan_cap: int | None = None,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+  """Encodes a stream of ChatML examples into the first ``n`` usable SFT rows.
+
+  Consumes any iterator of ``{"messages": [{"role","content"}, ...]}`` (a single
+  corpus or a weighted blend), masks loss to assistant turns via
+  :func:`encode_agent_conversation`, drops rows with no surviving assistant token,
+  caps each row at ``max_seq_len``, shuffles with ``seed``, and cycles to fill if
+  the stream runs dry before ``n`` rows. Returns exactly ``n`` rows.
+  """
+  im_start, im_end, newline_ids = resolve_chatml_ids(tokenizer)
+  cap = scan_cap if scan_cap is not None else max(n * 4, 4000)
+  rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+  scanned = 0
+  dropped = 0
+  truncated = 0
+  for ex in examples:
+    scanned += 1
+    msgs = ex.get("messages", [])
+    enc = encode_agent_conversation(
+        tokenizer, msgs, max_seq_len,
+        im_start_id=im_start, im_end_id=im_end, newline_ids=newline_ids,
+    )
+    if enc is None:
+      dropped += 1
+    else:
+      # Flag rows that filled the whole window (likely truncated mid-episode).
+      if int(enc[2].sum()) >= max_seq_len:
+        truncated += 1
+      rows.append(enc)
+      if len(rows) >= n:
+        break
+    if scanned >= cap:
+      break
+
+  if not rows:
+    raise ValueError(
+        f"No usable agent episodes after scanning {scanned} rows "
+        f"(all empty or longer than max_seq_len={max_seq_len})."
+    )
+  print(
+      f"[agent-sft] scanned={scanned} usable={len(rows)} dropped={dropped} "
+      f"window_full={truncated} (max_seq_len={max_seq_len})",
+      flush=True,
+  )
+  random.Random(seed).shuffle(rows)
+  if len(rows) < n:
+    print(
+        f"[agent-sft] only {len(rows)}/{n} usable rows; cycling to fill.",
+        flush=True,
+    )
+    base = list(rows)
+    while len(rows) < n:
+      rows.append(base[len(rows) % len(base)])
+  return rows[:n]
+
+
+class _EncodedRowSource(grain.RandomAccessDataSource):
+  """A grain random-access source over pre-encoded ``(tokens, loss, pad)`` rows."""
+
+  def __init__(self, rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]]):
+    self._rows = rows
+
+  def __len__(self) -> int:
+    return len(self._rows)
+
+  def __getitem__(self, idx: int):
+    return self._rows[idx]
+
+
+class _AgentSFTSource(_EncodedRowSource):
   """A grain source of pre-tokenized agent episodes streamed from HuggingFace.
 
-  Streams from :func:`agent_data.agent_traces.load_agent_traces`, encodes each episode
-  with :func:`encode_agent_conversation`, and keeps the first ``n`` usable rows.
-  Rows are shuffled with ``seed``; if the stream runs dry before ``n`` rows the
-  collected rows are cycled to fill (logged), so the trainer still gets ``n``.
+  Streams from :func:`agent_data.agent_traces.load_agent_traces`, encodes each
+  episode with :func:`encode_agent_conversation`, and keeps the first ``n`` usable
+  rows (shuffled with ``seed``; cycled to fill if the stream runs dry).
   """
 
   def __init__(
@@ -150,57 +227,47 @@ class _AgentSFTSource(grain.RandomAccessDataSource):
       limit: int | None = None,
       scan_cap: int | None = None,
   ):
-    im_start, im_end, newline_ids = resolve_chatml_ids(tokenizer)
-    cap = scan_cap if scan_cap is not None else max(n * 4, 4000)
-    rows: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-    scanned = 0
-    dropped = 0
-    truncated = 0
-    for ex in load_agent_traces(limit=limit):
-      scanned += 1
-      msgs = ex.get("messages", [])
-      enc = encode_agent_conversation(
-          tokenizer, msgs, max_seq_len,
-          im_start_id=im_start, im_end_id=im_end, newline_ids=newline_ids,
-      )
-      if enc is None:
-        dropped += 1
-      else:
-        # Flag rows that filled the whole window (likely truncated mid-episode).
-        if int(enc[2].sum()) >= max_seq_len:
-          truncated += 1
-        rows.append(enc)
-        if len(rows) >= n:
-          break
-      if scanned >= cap:
-        break
-
-    if not rows:
-      raise ValueError(
-          f"No usable agent episodes after scanning {scanned} rows "
-          f"(all empty or longer than max_seq_len={max_seq_len})."
-      )
-    print(
-        f"[agent-sft] scanned={scanned} usable={len(rows)} dropped={dropped} "
-        f"window_full={truncated} (max_seq_len={max_seq_len})",
-        flush=True,
+    rows = _collect_encoded_rows(
+        tokenizer, load_agent_traces(limit=limit), n, seed, max_seq_len,
+        scan_cap=scan_cap,
     )
-    random.Random(seed).shuffle(rows)
-    if len(rows) < n:
-      print(
-          f"[agent-sft] only {len(rows)}/{n} usable rows; cycling to fill.",
-          flush=True,
-      )
-      base = list(rows)
-      while len(rows) < n:
-        rows.append(base[len(rows) % len(base)])
-    self._rows = rows[:n]
+    super().__init__(rows)
 
-  def __len__(self) -> int:
-    return len(self._rows)
 
-  def __getitem__(self, idx: int):
-    return self._rows[idx]
+class _MixtureSFTSource(_EncodedRowSource):
+  """A grain source over a *weighted blend* of several trace corpora.
+
+  Weight-interleaves the ``sources`` (per :func:`mixtures.interleave_sources`),
+  encodes each example with assistant-turn masking, and keeps the first ``n``
+  usable rows. The empirical per-source sampling ratio over the drawn rows matches
+  the configured weights in expectation (modulo per-source caps / exhaustion).
+  """
+
+  def __init__(
+      self,
+      tokenizer,
+      sources: list[DatasetSource],
+      n: int,
+      seed: int,
+      max_seq_len: int,
+      *,
+      per_source_limit: int | None = None,
+      scan_cap: int | None = None,
+      shard_loader=None,
+  ):
+    names = ", ".join(f"{s.name}:{s.weight:g}" for s in sources)
+    print(f"[agent-sft] mixture sources -> {names}", flush=True)
+    stream = interleave_sources(
+        sources, seed=seed, per_source_limit=per_source_limit,
+        shard_loader=shard_loader,
+    )
+    # The blend can be very large; bound the scan so a build is finite even when
+    # every source has many shards. Default: enough to fill n with headroom.
+    cap = scan_cap if scan_cap is not None else max(n * 6, 6000)
+    rows = _collect_encoded_rows(
+        tokenizer, stream, n, seed, max_seq_len, scan_cap=cap,
+    )
+    super().__init__(rows)
 
 
 def _to_columns(batch):
@@ -220,13 +287,26 @@ def build_agent_sft_dataset(
     max_seq_len: int,
     *,
     limit: int | None = None,
+    sources: list[DatasetSource] | None = None,
+    per_source_limit: int | None = None,
+    shard_loader=None,
 ) -> grain.MapDataset:
   """Batched grain dataset of agent-SFT rows.
 
   Uses grain (not HF ``.batch()``) because tunix's ``jax.tree.map(np.repeat, ...)``
   collation corrupts HF-batched rows.
+
+  If ``sources`` is given it builds a **weighted blend** of those corpora
+  (multi-dataset mixing); otherwise it streams the single in-domain corpus
+  (``load_agent_traces``), preserving the original behavior.
   """
-  source = _AgentSFTSource(tokenizer, n, seed, max_seq_len, limit=limit)
+  if sources:
+    source: grain.RandomAccessDataSource = _MixtureSFTSource(
+        tokenizer, sources, n, seed, max_seq_len,
+        per_source_limit=per_source_limit, shard_loader=shard_loader,
+    )
+  else:
+    source = _AgentSFTSource(tokenizer, n, seed, max_seq_len, limit=limit)
   return grain.MapDataset.source(source).batch(batch_size).map(_to_columns)
 
 
@@ -241,6 +321,8 @@ def run_agent_sft(
     max_seq_len: int,
     seed: int = 0,
     limit: int | None = None,
+    sources: list[DatasetSource] | None = None,
+    per_source_limit: int | None = None,
     checkpoint_dir: str | None = None,
     save_interval_secs: int = 600,
     max_to_keep: int = 2,
@@ -261,7 +343,12 @@ def run_agent_sft(
     mesh: the device mesh the model is sharded on.
     max_seq_len: padded episode length; longer episodes are truncated.
     seed: PRNG seed for row shuffling.
-    limit: cap on how many HF rows to stream (``None`` = all ~15.2k).
+    limit: cap on how many HF rows to stream from the single in-domain corpus
+      (``None`` = all ~15.2k). Ignored when ``sources`` is given.
+    sources: optional list of :class:`mixtures.DatasetSource` for a weighted
+      multi-dataset blend; when set, the single-corpus path is bypassed.
+    per_source_limit: optional cap on usable rows drawn per source in the blend
+      (in addition to each source's own ``cap``); small for smoke runs.
     checkpoint_dir: orbax checkpoint root (local or ``gs://``); ``None`` disables.
     save_interval_secs: minimum seconds between periodic checkpoints.
     max_to_keep: number of checkpoints to retain.
@@ -272,6 +359,7 @@ def run_agent_sft(
   n = (steps + 2) * batch_size
   dataset = build_agent_sft_dataset(
       tokenizer, n, seed, batch_size, max_seq_len, limit=limit,
+      sources=sources, per_source_limit=per_source_limit,
   )
   optimizer = clipped_adamw(learning_rate)
 
