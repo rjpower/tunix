@@ -211,13 +211,21 @@ def put_params_on_memory_kind(
     return params
   original_shardings = jax.tree.map(lambda x: x.sharding, params)
   logging.debug("original_shardings: %s", original_shardings)
-  is_on_device = jax.tree_util.tree_reduce(
-      operator.or_,
-      jax.tree.map(lambda x: x.memory_kind == "device", original_shardings),
+  # Skip the move ONLY when EVERY leaf is already on the requested memory kind.
+  # The previous tree-wide OR short-circuit ("any leaf on device") left a MIXED
+  # tree half-moved: requesting "device" on a tree whose small leaves are already
+  # on device returned early and stranded the offloaded embedding on host. The
+  # rollout prefill then ran `gather` with the embedding on <host> and indices on
+  # device -> "memory_space of all inputs passed to gather must be the same".
+  # device_put below already no-ops the already-correct leaves and moves the rest.
+  all_on_target = jax.tree_util.tree_reduce(
+      operator.and_,
+      jax.tree.map(
+          lambda s: s.memory_kind == memory_kind, original_shardings
+      ),
+      True,
   )
-  if (is_on_device and memory_kind == "device") or (
-      not is_on_device and memory_kind == "pinned_host"
-  ):
+  if all_on_target:
     logging.info(
         "Params are already on the requested memory kind: %s", memory_kind
     )

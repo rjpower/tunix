@@ -1536,6 +1536,10 @@ gpu = [
 ]
 mega = [
     { name = "gcsfs" },
+    { name = "marin-fray", version = "0.2.20.dev202606180959", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or (extra == 'extra-12-google-tunix-gpu' and extra == 'extra-12-google-tunix-prod')" },
+    { name = "marin-fray", version = "0.2.24.dev202606221125", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-12-google-tunix-gpu' and extra == 'extra-12-google-tunix-prod')" },
+    { name = "marin-iris", version = "0.2.20.dev202606180959", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or (extra == 'extra-12-google-tunix-gpu' and extra == 'extra-12-google-tunix-prod')" },
+    { name = "marin-iris", version = "0.2.24.dev202606221125", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-12-google-tunix-gpu' and extra == 'extra-12-google-tunix-prod')" },
     { name = "pyarrow" },
     { name = "wandb" },
 ]
@@ -1586,6 +1590,8 @@ requires-dist = [
     { name = "jaxtyping" },
     { name = "jinja2" },
     { name = "kagglehub" },
+    { name = "marin-fray", marker = "extra == 'mega'" },
+    { name = "marin-iris", marker = "extra == 'mega'" },
     { name = "matplotlib", marker = "extra == 'docs'", specifier = ">=3.10.0" },
     { name = "myst-nb", marker = "extra == 'docs'", specifier = ">=1.3.0" },
     { name = "numba" },

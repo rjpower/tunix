@@ -95,6 +95,14 @@ mega = [
   # and the mega_eval data-mixture streamer both use pyarrow; the PyPI wheel
   # ships the `pyarrow.flight` gRPC component we need.
   "pyarrow>=14.0.0",
+  # Disaggregated RL runs the trainer/rollout as SEPARATE iris jobs and rendezvous
+  # over the cluster-global iris endpoint registry (mega_eval.rl.iris_coordinator),
+  # so the iris client must be importable IN-JOB (not just locally). Plain
+  # marin-iris (no [controller]) suffices in-job: the endpoint registry RPCs the
+  # iris controller via connectrpc; [controller]'s kubernetes client is only the
+  # submit-side path for k8s-backed clusters.
+  "marin-iris",
+  "marin-fray",
 ]
 
 [project.urls]

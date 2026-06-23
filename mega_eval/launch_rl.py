@@ -60,7 +60,7 @@ from mega_eval.models.checkpoint import restore_sft_model
 from mega_eval.models.registry import get_model_spec
 from mega_eval.rl.agent import TerminusAgent
 from mega_eval.rl.environment import TerminalBenchEnv, register_tasks
-from mega_eval.training.common import build_mesh, clipped_adamw, init_distributed, metrics_logging_options
+from mega_eval.training.common import build_mesh, build_mesh_over, clipped_adamw, init_distributed, metrics_logging_options
 
 
 def _ensure_model(repo: str, model_dir: str) -> str:
@@ -114,16 +114,59 @@ def main() -> None:
   learning_rate = float(os.environ.get("LR", "1e-6"))
   beta = float(os.environ.get("BETA", "0.0"))
   tp = int(os.environ.get("TP", "1"))
+  # The vanilla rollout allocates the KV cache REPLICATED on every chip (it is
+  # created eagerly via jnp.zeros in the sampler and fed to jax.jit with no
+  # in_shardings, so neither tp nor fsdp shards it). With the colocated actor's
+  # fp32 params+AdamW resident, an 8B leaves only ~8 GB free -> the prefill OOMs
+  # for any real batch x kv. OFFLOAD_TO_CPU=1 parks the actor optimizer/master on
+  # host RAM during the rollout, freeing ~all HBM for the cache. Costs a host
+  # round-trip of the actor state per step; required to scale batch>~2 at full kv.
+  offload_to_cpu = os.environ.get("OFFLOAD_TO_CPU", "0") == "1"
   max_concurrency = int(os.environ.get("MAX_CONCURRENCY", "8"))
   command_timeout = float(os.environ.get("COMMAND_TIMEOUT", "60"))
   episode_timeout = float(os.environ.get("EPISODE_TIMEOUT", "1200"))
 
+  # On CW (no gs://) the SFT checkpoint lives on R2 (s3://); orbax can't read
+  # s3:// directly, so stage it to local NVMe first (no-op for local/gs:// paths).
+  if ckpt_dir and ckpt_dir.startswith("s3://"):
+    from mega_eval.models.checkpoint_staging import stage_checkpoint_if_remote
+    print(f"[ota-rl] staging checkpoint {ckpt_dir} -> local NVMe ...", flush=True)
+    ckpt_dir = stage_checkpoint_if_remote(ckpt_dir, local_root="./_staged_ckpt")
+
   spec = get_model_spec(model_name)
   base_dir = _ensure_model(spec.repo, os.environ.get("AGENT_MODEL_DIR") or f"./{spec.name}")
   print(f"[ota-rl] jax {jax.__version__} devices={jax.device_count()} model={spec.name} "
-        f"ckpt={ckpt_dir} G={num_generations} ppb={prompts_per_batch} steps={steps}", flush=True)
+        f"ckpt={ckpt_dir} G={num_generations} ppb={prompts_per_batch} steps={steps} "
+        f"tp={tp} offload_cpu={offload_to_cpu} kv={max_prompt_len + max_response_tokens + 16}", flush=True)
 
-  mesh = build_mesh(tp=tp)
+  # Topology: colocated (default; ACTOR+ROLLOUT share one mesh, used on TPU) OR
+  # disaggregated (DISAGGREGATE=1; ROLLOUT runs on its OWN GPUs so it doesn't
+  # share HBM with the actor optimizer/master -- the GPU path). The actor/reference
+  # load on the ACTOR mesh; tunix reshards actor params -> rollout mesh each step.
+  disaggregate = os.environ.get("DISAGGREGATE", "0") == "1"
+  if disaggregate:
+    devs = list(jax.devices())
+    rollout_gpus = int(os.environ.get("ROLLOUT_GPUS", "2"))
+    rollout_tp = int(os.environ.get("ROLLOUT_TP", str(rollout_gpus)))
+    if not 0 < rollout_gpus < len(devs):
+      raise ValueError(f"ROLLOUT_GPUS={rollout_gpus} must be in (0, {len(devs)}).")
+    actor_devs, rollout_devs = devs[:len(devs) - rollout_gpus], devs[len(devs) - rollout_gpus:]
+    # The Qwen3 dims (hidden 4096=2^12, vocab 151936=2^7*1187) require power-of-2
+    # mesh axes, so each side's GPU count must be a power of 2 (else a deep jax
+    # IndivisibleError mid-load). On 8 GPUs the clean split is ROLLOUT_GPUS=4.
+    _pow2 = lambda n: n > 0 and (n & (n - 1)) == 0
+    if not (_pow2(len(actor_devs)) and _pow2(rollout_gpus)):
+      raise ValueError(
+          f"DISAGGREGATE needs power-of-2 actor ({len(actor_devs)}) and rollout "
+          f"({rollout_gpus}) GPU counts; on {len(devs)} GPUs use ROLLOUT_GPUS=4 "
+          f"(actor 4 + rollout 4).")
+    mesh = build_mesh_over(actor_devs, tp=tp)
+    rollout_mesh = build_mesh_over(rollout_devs, tp=rollout_tp)
+    print(f"[ota-rl] DISAGGREGATED actor={[d.id for d in actor_devs]}(tp={tp}) "
+          f"rollout={[d.id for d in rollout_devs]}(tp={rollout_tp})", flush=True)
+  else:
+    mesh = build_mesh(tp=tp)
+    rollout_mesh = mesh
   tokenizer = spec.load_tokenizer(base_dir)
   # remat=NONE: the rollout sampler mutates the KV-cache Params, which conflicts
   # with remat's trace level. restore_sft_model already loads remat=NONE.
@@ -183,11 +226,11 @@ def main() -> None:
   cluster_config = rl_cluster_lib.ClusterConfig(
       role_to_mesh={
           rl_cluster_lib.Role.ACTOR: mesh,
-          rl_cluster_lib.Role.ROLLOUT: mesh,
+          rl_cluster_lib.Role.ROLLOUT: rollout_mesh,
           **({rl_cluster_lib.Role.REFERENCE: mesh} if reference is not None else {}),
       },
       rollout_engine="vanilla",  # native JAX rollout (no vLLM on these TPUs)
-      offload_to_cpu=False,
+      offload_to_cpu=offload_to_cpu,
       training_config=rl_cluster_lib.RLTrainingConfig(
           actor_optimizer=clipped_adamw(learning_rate),
           eval_every_n_steps=10**9,

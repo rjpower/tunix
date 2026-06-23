@@ -24,7 +24,16 @@ def init_distributed() -> None:
   system is not available". On TPU this auto-detects the coordinator from the
   slice metadata; on a single host it's a harmless no-op. Idempotent: a second
   call (or a harness that already initialized) is ignored.
+
+  GUARD: only initialize on TPU (``PJRT_DEVICE==TPU``). On a single GPU node
+  (1 process, e.g. the CW 8xH100 box) ``jax.distributed.initialize()`` has no
+  coordinator to auto-detect and can HANG; skip it there (single-process needs
+  no distributed client). Multi-node GPU would need an explicit coordinator.
   """
+  if os.environ.get("PJRT_DEVICE", "").upper() != "TPU":
+    print("[dist] non-TPU (PJRT_DEVICE!=TPU): skipping jax.distributed.initialize",
+          flush=True)
+    return
   try:
     jax.distributed.initialize()
   except RuntimeError as e:  # already initialized
@@ -106,12 +115,23 @@ def build_mesh(tp: int = 1) -> jax.sharding.Mesh:
   Raises:
     ValueError: if ``tp`` does not divide the device count.
   """
-  ndev = jax.device_count()
+  return build_mesh_over(jax.devices(), tp=tp)
+
+
+def build_mesh_over(devices, tp: int = 1) -> jax.sharding.Mesh:
+  """Like :func:`build_mesh` but over an explicit device SUBSET.
+
+  Used to carve the local device pool into disjoint ACTOR and ROLLOUT meshes for
+  a disaggregated RL topology (the rollout runs on its own GPUs so it does not
+  share HBM with the actor's optimizer/master -- sidestepping the colocated
+  vanilla-rollout KV OOM). Same ``("fsdp","tp")`` axes as :func:`build_mesh`.
+  """
+  ndev = len(devices)
   if ndev % tp != 0:
-    raise ValueError(f"tp={tp} does not divide device_count={ndev}.")
+    raise ValueError(f"tp={tp} does not divide len(devices)={ndev}.")
   fsdp = ndev // tp
-  devices = np.asarray(jax.devices()).reshape(fsdp, tp)
-  return jax.sharding.Mesh(devices, axis_names=("fsdp", "tp"))
+  arr = np.asarray(list(devices)).reshape(fsdp, tp)
+  return jax.sharding.Mesh(arr, axis_names=("fsdp", "tp"))
 
 
 def sft_model_input_fn(batch: dict) -> dict:
