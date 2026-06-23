@@ -16,7 +16,7 @@
 
 import dataclasses
 import enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import jax
 import jaxtyping
@@ -75,6 +75,7 @@ class RolloutEngineGroup:
       self,
       params: jaxtyping.PyTree,
       filter_types: Optional[Tuple[Any, ...]] = None,
+      reshard_fns: Optional[List[Any]] = None,
   ):
     raise NotImplementedError("Not implemented for RolloutEngineGroup.")
 

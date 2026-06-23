@@ -49,6 +49,7 @@ from tunix.rl import common
 from tunix.rl import reshard
 from tunix.rl import trainer as rl_trainer
 from tunix.rl import utils as rl_utils
+from tunix.rl import weight_transfer
 from tunix.rl.inference import inference_worker
 from tunix.rl.rollout import base_rollout
 from tunix.rl.rollout import vanilla_rollout
@@ -176,12 +177,20 @@ class ClusterConfig:
       random weights instead of loading from the given path.
     rollout_vllm_tpu_backend_type: The TPU Jax backend type for vllm rollout
       engine, E.g. "jax", "torchax" or "pytorch_xla".
+    reshard_backend: Which local (in-program) reshard backend to use for weight
+      sync and model load/relocate. Defaults to ``AUTO``, which tries Pathways
+      then ``jax.device_put`` -- byte-identical to the historical fallback
+      order. Set ``JAX_DEVICE`` to skip the Pathways import attempt off-GCP, or
+      ``PATHWAYS`` to require the Pathways backend.
   """
 
   role_to_mesh: dict[Role, Mesh]
   role_to_logical_axis_rule: dict[Role, flax.typing.LogicalRules] | None = None
   rollout_engine: str | type[base_rollout.BaseRollout] = "vanilla"
   offload_to_cpu: bool = False
+  reshard_backend: weight_transfer.LocalReshardBackend = (
+      weight_transfer.LocalReshardBackend.AUTO
+  )
 
   training_config: RLTrainingConfig
   rollout_config: (
@@ -206,6 +215,13 @@ class RLCluster:
     self.cluster_config = cluster_config
     self.perf_config = perf_config
     self.r2m = cluster_config.role_to_mesh
+    # Resolve the local weight-transfer backend once (no global singleton). The
+    # resolved reshard_fns are threaded through model load and weight sync so
+    # the whole cluster uses one consistent backend. Must be set up before the
+    # first `_load_model` call below, which reshards the actor onto its mesh.
+    self._weight_transfer = weight_transfer.LocalWeightTransfer(
+        cluster_config.reshard_backend
+    )
     self._init_backbone_sharing_map(actor, reference)
     self._anchor_policy_state = None
 
@@ -357,7 +373,12 @@ class RLCluster:
         else:
           tmp_state = state
         model_or_path = nnx.merge(
-            graph, reshard.reshard_pytree(tmp_state, dst_shardings)
+            graph,
+            reshard.reshard_pytree(
+                tmp_state,
+                dst_shardings,
+                reshard_fns=self._weight_transfer.reshard_fns,
+            ),
         )
         del tmp_state
         gc.collect()
@@ -705,6 +726,18 @@ class RLCluster:
     self.actor_trainer.close()
     if getattr(self, "critic_trainer", None):
       self.critic_trainer.close()
+    self._weight_transfer_cleanup()
+
+  def _weight_transfer_cleanup(self) -> None:
+    """Releases weight-transfer handles on cluster shutdown.
+
+    For the local reshard backend this is a no-op (it owns no out-of-band
+    handles). The hook exists so a future remote weight-transfer backend can
+    release sockets/buffers from the same shutdown path.
+    """
+    weight_transfer_obj = getattr(self, "_weight_transfer", None)
+    if weight_transfer_obj is not None:
+      weight_transfer_obj.close()
 
   def _log_metrics(self, metrics_buffer: MetricsBuffer) -> None:
     """Log metrics."""
@@ -1166,7 +1199,11 @@ class RLCluster:
           else nnx.Param,
       )
       src_filtered_params = nnx.state(self.actor_trainer.model, filter_types)
-      self.rollout.update_params(src_filtered_params, filter_types)
+      self.rollout.update_params(
+          src_filtered_params,
+          filter_types,
+          reshard_fns=self._weight_transfer.reshard_fns,
+      )
       # The anchor policy state is snapshotted from actor_trainer.model.
       self._anchor_policy_state = rl_utils.put_params_on_memory_kind(
           nnx.state(self.actor_trainer.model), "pinned_host"

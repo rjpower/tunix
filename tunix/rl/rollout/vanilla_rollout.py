@@ -17,7 +17,7 @@
 import dataclasses
 import functools
 import operator
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from flax import nnx
 import jax
@@ -93,10 +93,13 @@ class VanillaRollout(base_rollout.BaseRollout):
       self,
       params: jaxtyping.PyTree,
       filter_types: Optional[Tuple[Any, ...]] = None,
+      reshard_fns: Optional[List[Any]] = None,
   ) -> None:
     if filter_types is not None:
       dst_params = nnx.state(self.model(), filter_types)
-      resharded_params = reshard.reshard_pytree(params, dst_params)
+      resharded_params = reshard.reshard_pytree(
+          params, dst_params, reshard_fns=reshard_fns
+      )
     else:
       resharded_params = params
     flat_new_params, _ = utils.to_flat_dict(resharded_params)

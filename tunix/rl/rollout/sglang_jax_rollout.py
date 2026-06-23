@@ -14,7 +14,7 @@
 
 """sglang jax rollout worker with Tunix sampler."""
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from flax import nnx
 import jax
@@ -116,7 +116,10 @@ class SglangJaxRollout(base_rollout.BaseRollout):
       self,
       params: jaxtyping.PyTree,
       filter_types: Optional[Tuple[Any, ...]] = None,
+      reshard_fns: Optional[List[Any]] = None,  # pylint: disable=unused-argument
   ) -> None:
+    # sglang_jax reshards internally inside its sampler; the local
+    # reshard-backend selection is not threaded into it in P1.
     self._sampler.update_params(params, filter_types)
 
   def pad_id(self) -> int:

@@ -320,12 +320,14 @@ class MockRollout(base_rollout.BaseRollout):
       self,
       params: jaxtyping.PyTree,
       filter_types: tuple[Any, ...] | None = None,
+      reshard_fns: list[Any] | None = None,
   ) -> None:
     """Mock update params.
 
     Args:
       params: A PyTree of parameters to update.
       filter_types: Optional types to filter which parameters to update.
+      reshard_fns: Ignored; mock rollout does not reshard.
     """
     pass
 

@@ -270,8 +270,19 @@ class BaseRollout(ABC):
       self,
       params: jaxtyping.PyTree,
       filter_types: Optional[Tuple[Any, ...]] = None,
+      reshard_fns: Optional[List[Any]] = None,
   ) -> None:
-    """Updates the rollout model parameters."""
+    """Updates the rollout model parameters.
+
+    Args:
+      params: The new parameters to load into the rollout model.
+      filter_types: Optional nnx variable types to filter; when provided, the
+        rollout reshards ``params`` onto its own mesh before applying them.
+      reshard_fns: Optional ordered list of local reshard-backend factories (as
+        returned by ``weight_transfer.select_reshard_fns``) to use for that
+        reshard. When None, the AUTO backend fallback order is used. Engines
+        that do not reshard via ``reshard_pytree`` may ignore this argument.
+    """
 
   @abstractmethod
   def pad_id(self) -> int:
