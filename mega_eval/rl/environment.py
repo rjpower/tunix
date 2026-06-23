@@ -51,7 +51,7 @@ def _as_scalar(value):
   elif isinstance(value, (list, tuple)):
     value = value[0]
   if isinstance(value, bytes):
-    return value.decode("utf-8")
+    return value.decode("utf-8", errors="replace")
   if isinstance(value, np.generic):
     return value.item()
   return value

@@ -55,19 +55,41 @@ class Sandbox(Protocol):
     ...
 
 
+def _as_text(value) -> str:
+  """Coerces subprocess output (str | bytes | None) to str, never raising.
+
+  Agent commands run arbitrary programs whose stdout/stderr may be non-UTF-8
+  (binary dumps, latin-1 logs), so a strict decode would crash the episode/rollout
+  on a stray byte. And on a timeout ``TimeoutExpired.stdout/stderr`` come back as
+  *bytes* even when ``text=True`` was requested, which then breaks a ``str +``
+  concat. Decoding with ``errors="replace"`` handles both.
+  """
+  if value is None:
+    return ""
+  if isinstance(value, bytes):
+    return value.decode("utf-8", errors="replace")
+  return value
+
+
 def _run(argv: list[str], *, timeout: float, input_text: str | None = None) -> ExecResult:
-  """Runs a subprocess with a hard timeout, capturing stdout/stderr."""
+  """Runs a subprocess with a hard timeout, capturing stdout/stderr.
+
+  Output is decoded leniently (``errors="replace"``) because agent-issued commands
+  can emit non-UTF-8 bytes; a strict decode would raise mid-episode. See
+  :func:`_as_text` for the timeout-path bytes handling.
+  """
   try:
     proc = subprocess.run(
         argv,
         input=input_text,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=timeout,
     )
-    return ExecResult(proc.stdout, proc.stderr, proc.returncode)
+    return ExecResult(_as_text(proc.stdout), _as_text(proc.stderr), proc.returncode)
   except subprocess.TimeoutExpired as e:
-    return ExecResult(e.stdout or "", (e.stderr or "") + "\n[timeout]", 124, timed_out=True)
+    return ExecResult(_as_text(e.stdout), _as_text(e.stderr) + "\n[timeout]", 124, timed_out=True)
 
 
 # --- Runtime bootstrap of docker + runsc -------------------------------------
