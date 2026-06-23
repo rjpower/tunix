@@ -522,3 +522,41 @@ disjoint-mesh `device_put` returns correct values yet SIGSEGVs on teardown in XL
 cross-host receive notifier (v6e/jax 0.10.2). Keep trainer/rollout meshes on the same
 host(s) for colocated TPU RL; a different-host topology needs a real transport (Arrow/NCCL/
 remote control plane). On GPU this rides NCCL (not XLA TPU cross-host) — verify separately.
+
+## 12. Weight-transfer performance (measured, off-Pathways)
+Bench: `mega_eval/bench_weight_transfer.py` (env-driven: `BENCH_MODE`, `MODEL_PRESET`,
+`N_SYNC`, `SERVE_SECONDS`, `NIC_GBPS`). Model = Qwen3-8B-shaped, **15.3 GiB bf16** on the
+wire (30.5 GiB fp32 in HBM). Two transports under one registry:
+`nccl` (in-JAX-world cross-mesh reshard, XLA→NCCL) and `arrow_flight` (host-staged gRPC, the
+cross-host path that sidesteps the §11.5 SIGSEGV).
+
+**GPU — 8×H100, single node (`cw-us-east-02a`):**
+- Cross-mesh reshard ceiling (`mega_eval/reshard_probe.py`): **in-mesh 78 GB/s**,
+  **disjoint-mesh 64 GB/s**, sharded→sharded. XLA lowers `device_put` to NCCL over **all**
+  GPUs (no rank-0 fold). This is the GPU weight-sync answer — no torch / raw-NCCL needed for
+  single-node colocated sync.
+- 1 trainer (4 GPU) + 4 rollouts (1 GPU each, **replicated**): aggregate **11.5 GB/s**,
+  per-client 2.87 GB/s. The cap is **gather-to-a-single-device** (~2.9 GB/s), *not* the
+  interconnect — **shard inference targets across ≥2 GPUs (tp)** to ride the 64–78 GB/s path.
+
+**TPU — v6e-16, 4 hosts (marin), `arrow_flight` cross-NIC:**
+- 1 trainer host → 3 inference hosts, each pulling the full 15.3 GiB bf16 model, 15 rounds:
+  per-worker median **~4.5 GB/s** (best ~5.4), **aggregate ~13.5 GB/s** (≈108 Gbps — near the
+  trainer's NIC line rate). Device→host materialize 5.4 GB/s; restore/reshard 0.6–1.3 s.
+- Aggregate is capped by the **trainer's single NIC** (3 workers already saturate it); to
+  scale past one NIC, serve a shard from each trainer host.
+
+**Three transport bugs the bench surfaced (all fixed):**
+1. `serve_weights` ran a global `sync_global_devices` barrier (marin's multi-host-trainer
+   sync) that deadlocks a disaggregated trainer↔inference layout → gated behind
+   `WeightTransferConfig.serve_barrier` (default **off**; Arrow is a network transport, the
+   only collective belongs to the caller).
+2. `flatten_for_transfer` did an **on-device `reshape(-1)` of a sharded tensor** → compiles an
+   all-gather; on multi-host TPU a jit over one host's local sub-mesh makes XLA reference
+   another host's `device_id` and aborts (`RET_CHECK device_id < kMaxDeviceCount`). Fixed:
+   cast bf16 elementwise (collective-free) → `device_get` local shards → reshape on host.
+   `restore_from_flat` likewise `device_put`s the host array straight to the target sharding
+   (no single-device staging, no on-device collective).
+3. The `jax.distributed` KV coordinator used insert-only `key_value_set` → 2nd serve hit
+   `ALREADY_EXISTS` on `/latest`. Fixed: `allow_overwrite=True` + non-blocking
+   `key_value_try_get` (no per-poll 1 s timeout).
