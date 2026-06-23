@@ -82,6 +82,14 @@ class WeightTransferConfig:
   convert_to_bfloat16: bool = True
   sync_interval_steps: int = 1
   transfer_timeout: float = 600.0
+  # Only sync the trainer's *own* shards with a jax collective barrier inside
+  # serve_weights. Correct ONLY when every process in the JAX world is a
+  # training host that calls serve_weights in lockstep (marin's multi-host
+  # trainer). MUST be False for disaggregation (trainer + inference in one
+  # world, or separate worlds): inference workers never call serve_weights, so
+  # a global barrier there would deadlock. Arrow Flight is a network transport;
+  # it needs no jax collective by default.
+  serve_barrier: bool = False
   # Arrow Flight.
   flight_host: str = "0.0.0.0"
   num_flight_servers: int = 0

@@ -374,10 +374,12 @@ class ArrowFlightServer(base.WeightTransferServer):
     self.metrics.total_transfers += 1
     start = time.time()
     try:
-      _barrier_sync()
+      if self.config.serve_barrier:
+        _barrier_sync()
 
       if jax.process_index() != 0:
-        _barrier_sync()
+        if self.config.serve_barrier:
+          _barrier_sync()
         return
 
       keys, flat = state_dict.flatten_for_transfer(
@@ -435,7 +437,8 @@ class ArrowFlightServer(base.WeightTransferServer):
           self.metrics.store_time,
       )
 
-      _barrier_sync()
+      if self.config.serve_barrier:
+        _barrier_sync()
     except Exception:
       self.metrics.failed_transfers += 1
       logger.exception("Failed to serve weights %s via Arrow Flight", weight_id)
