@@ -205,18 +205,25 @@ def _bench_nccl(
   )
 
   per_round = []
+  pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_clients)
   for r in range(n_sync + 1):  # +1 warmup (compile)
     t0 = time.time()
     server.serve_weights(r + 1, params)
-    # Reshard onto every rollout worker. Each receive_weights is its own XLA
-    # all-to-all; dispatch all then block.
-    updates = [c.receive_weights(t) for c, t in zip(clients, templates)]
+    # Fan out concurrently: each client's reshard is an independent XLA op on a
+    # different target mesh, so dispatching from N threads lets them overlap
+    # (a serial list-comprehension would block on each client in turn).
+    futs = [
+        pool.submit(c.receive_weights, t)
+        for c, t in zip(clients, templates)
+    ]
+    updates = [f.result() for f in futs]
     jax.block_until_ready([u.params for u in updates if u])
     dt = time.time() - t0
     if r == 0:
       print(f"[nccl] warmup round {dt*1000:.0f}ms (compile)")
       continue
     per_round.append(dt)
+  pool.shutdown(wait=True)
 
   med = statistics.median(per_round)
   agg_gbps = (wire_bytes * n_clients) / _GIB / med
