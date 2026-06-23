@@ -45,6 +45,7 @@ Run locally (CPU smoke):
 """
 
 import concurrent.futures
+import gc
 import json
 import os
 import statistics
@@ -401,9 +402,8 @@ def _maybe_init_distributed():
     common.init_distributed()
 
 
-def main():
-  _maybe_init_distributed()
-  mode = _env("BENCH_MODE", "nccl")
+def _run_one(mode: str):
+  """Runs one benchmark `mode` and prints its BENCH_RESULT_JSON line."""
   preset = _env("MODEL_PRESET", "tiny")
   n_clients = int(_env("N_CLIENTS", "4"))
   n_sync = int(_env("N_SYNC", "5"))
@@ -435,6 +435,21 @@ def main():
     raise ValueError(f"Unknown BENCH_MODE={mode!r}")
 
   print("BENCH_RESULT_JSON " + json.dumps(result, default=float))
+
+
+def main():
+  _maybe_init_distributed()
+  # BENCH_SUITE runs several modes in ONE process (so the iris-wired `python`
+  # entrypoint stays a single command -- wrapping in `bash -lc` loses the uv
+  # venv on PATH). gc.collect() between modes frees device buffers.
+  suite = _env("BENCH_SUITE", "")
+  if suite:
+    for mode in [m.strip() for m in suite.split(",") if m.strip()]:
+      _run_one(mode)
+      gc.collect()
+    print("BENCH_SUITE_DONE")
+    return
+  _run_one(_env("BENCH_MODE", "nccl"))
 
 
 if __name__ == "__main__":
