@@ -51,7 +51,7 @@ from huggingface_hub import snapshot_download
 from tunix.models.qwen3 import model as qm
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.agentic.agentic_grpo_learner import GRPOConfig, GRPOLearner
-from tunix.rl.agentic.parser.chat_template_parser.parser import QwenChatTemplateParser
+from mega_eval.rl.chat_parser import TerminusQwenParser
 from tunix.rl.rollout import base_rollout
 
 from mega_eval.eval.sandbox import build_image, prune_ota_images
@@ -101,6 +101,9 @@ def main() -> None:
   prompts_per_batch = int(os.environ.get("PROMPTS_PER_BATCH", "4"))
   task_limit = os.environ.get("TASK_LIMIT")
   task_limit = int(task_limit) if task_limit else None
+  # TASK_IDS (comma-separated) trains on a SPECIFIC set -- e.g. the score_spread
+  # tasks surfaced by eval -- instead of TASK_LIMIT's "first N" selection.
+  task_ids = os.environ.get("TASK_IDS")
   max_turns = int(os.environ.get("MAX_TURNS", "15"))
   # Total response-token budget per EPISODE (shared across turns; the collect
   # engine decrements it each turn). tunix requires the rollout's
@@ -137,7 +140,16 @@ def main() -> None:
   print("[ota-rl] LOAD OK", flush=True)
 
   # ---- Prebuild task images once, then register for env lookup. ----
-  tasks = load_tb_tasks(limit=task_limit)
+  if task_ids:
+    wanted = [t.strip() for t in task_ids.split(",") if t.strip()]
+    by_id = {t.task_id: t for t in load_tb_tasks()}
+    missing = [w for w in wanted if w not in by_id]
+    if missing:
+      raise SystemExit(f"[ota-rl] TASK_IDS not found in TB-dev: {missing}")
+    tasks = [by_id[w] for w in wanted]
+    print(f"[ota-rl] training on {len(tasks)} explicit TASK_IDS", flush=True)
+  else:
+    tasks = load_tb_tasks(limit=task_limit)
   print(f"[ota-rl] prebuilding {len(tasks)} task images", flush=True)
   built = []
   for t in tasks:
@@ -210,7 +222,7 @@ def main() -> None:
       rl_cluster=rl_cluster,
       algo_config=grpo_config,
       reward_fns=None,  # reward = env trajectory (grader) reward
-      chat_parser=QwenChatTemplateParser(tokenizer, enable_thinking=True),
+      chat_parser=TerminusQwenParser(tokenizer, enable_thinking=True),
       metric_fns=[_solve_rate_metric],
       agent_class=TerminusAgent,
       env_class=TerminalBenchEnv,
