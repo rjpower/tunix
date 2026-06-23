@@ -22,6 +22,7 @@ Use :func:`make_sandbox` to pick by ``OTA_SANDBOX`` env (``gvisor`` | ``local``)
 import dataclasses
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -294,6 +295,91 @@ class GvisorContainerSandbox:
     _run(["docker", "rm", "-f", self._name], timeout=30)
 
 
+# --- Optional Docker Hub pull-through mirror (Artifact Registry) -------------
+# Every TB-dev task Dockerfile pulls a Docker Hub *official* base (ubuntu:*,
+# python:*-slim*). Under a wide eval fan-out that risks Docker Hub rate limits,
+# so we optionally redirect those pulls through an Artifact Registry remote repo
+# (pull-through cache) by rewriting the staged Dockerfile's FROM lines.
+#
+# Set DOCKER_REGISTRY_MIRROR to the AR remote-repo prefix, e.g.
+#   us-docker.pkg.dev/hai-gcp-models/docker-mirror      (US jobs)
+#   europe-docker.pkg.dev/hai-gcp-models/docker-mirror  (EU jobs)
+# Unset => no rewrite (pull straight from Docker Hub). Only docker.io images are
+# mirrored; refs to other registries (gcr.io/ghcr.io/quay.io/...) and `scratch`
+# are left untouched. dockerd's registry-mirrors can't auth to a private AR repo,
+# so rewriting the staged FROM lines + a plain `docker login` is the robust path.
+_MIRROR_ENV = "DOCKER_REGISTRY_MIRROR"
+_FROM_RE = re.compile(r"^(\s*FROM\s+)((?:--\S+\s+)*)(\S+)(.*)$", re.IGNORECASE)
+_ar_logged_in: set[str] = set()
+
+
+def _mirror_image_ref(ref: str, mirror_prefix: str) -> str | None:
+  """Maps a Docker Hub image ref to the AR mirror path, or None to leave as-is.
+
+  Docker Hub *official* images (single-component names like ``ubuntu``) live
+  under ``library/`` in the registry, so the mirror path needs that prefix; an
+  ``org/name`` ref keeps its namespace. Refs to a non-Docker-Hub registry (a
+  first path component containing ``.``/``:``, e.g. ``gcr.io/...``) and
+  ``scratch`` return None (a Docker Hub remote repo can't serve them).
+  """
+  if ref.lower() == "scratch":
+    return None
+  body = ref
+  if body.startswith("docker.io/"):
+    body = body[len("docker.io/"):]
+  else:
+    first = body.split("/", 1)[0]
+    if "/" in body and ("." in first or ":" in first or first == "localhost"):
+      return None  # some other registry — our docker-mirror can't serve it
+  # `body` is now a Docker Hub repo path (+ optional :tag / @digest).
+  name = re.split(r"[:@]", body, maxsplit=1)[0]
+  if "/" not in name:
+    body = "library/" + body  # official image lives under library/
+  return mirror_prefix.rstrip("/") + "/" + body
+
+
+def _rewrite_dockerfile_for_mirror(text: str, mirror_prefix: str) -> str:
+  """Rewrites each FROM line's image ref to the AR mirror (where applicable).
+
+  Preserves ``--platform`` flags and any ``AS <stage>`` suffix; leaves non-FROM
+  lines, ``scratch``, intra-build stage refs, and non-Docker-Hub registries
+  untouched.
+  """
+  out = []
+  for line in text.splitlines():
+    m = _FROM_RE.match(line)
+    if m:
+      pre, flags, image, rest = m.groups()
+      new = _mirror_image_ref(image, mirror_prefix)
+      if new is not None:
+        line = f"{pre}{flags}{new}{rest}"
+    out.append(line)
+  return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def _ensure_ar_login(mirror_prefix: str) -> None:
+  """``docker login`` to the AR host of ``mirror_prefix`` via the GCE metadata token.
+
+  AR remote repos are private, so the nested dockerd needs creds to pull through
+  them. The TPU VM's service account already has artifactregistry.reader (iris
+  pulls the task base image through the sibling ghcr mirror), so we mint a
+  short-lived OAuth token from the metadata server -- no gcloud needed. Cached
+  per host so repeated builds log in once.
+  """
+  host = mirror_prefix.split("/", 1)[0]
+  if host in _ar_logged_in:
+    return
+  url = ("http://metadata.google.internal/computeMetadata/v1/instance/"
+         "service-accounts/default/token")
+  req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
+  with urllib.request.urlopen(req, timeout=10) as r:
+    token = json.load(r)["access_token"]
+  res = _run(["docker", "login", "-u", "oauth2accesstoken", "-p", token, host], timeout=30)
+  if res.exit_code != 0:
+    raise RuntimeError(f"docker login to AR mirror {host!r} failed: {res.stderr}")
+  _ar_logged_in.add(host)
+
+
 def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecResult:
   """Builds a Docker image from ``context_dir`` (must contain a Dockerfile).
 
@@ -306,6 +392,11 @@ def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecR
   cache; BuildKit can't follow symlinks that point outside the build context, so
   we first materialize the context with symlinks dereferenced.
 
+  If ``DOCKER_REGISTRY_MIRROR`` is set, the staged Dockerfile's Docker Hub FROM
+  lines are rewritten to pull through that Artifact Registry remote repo (and we
+  ``docker login`` to it once) -- a pull-through cache that avoids Docker Hub
+  rate limits under a wide fan-out. Unset => pull straight from Docker Hub.
+
   Build RUN steps (apt-get, etc.) need network egress, but dockerd runs with
   ``--bridge=none`` (so it can come up nested without iptables, which the stock
   iris image lacks). So we build with ``--network=host`` -- RUN steps use the
@@ -313,6 +404,7 @@ def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecR
   none``.
   """
   ensure_dockerd()
+  mirror = os.environ.get(_MIRROR_ENV, "").strip()
   staging = tempfile.mkdtemp(prefix="ota-build-")
   ctx = os.path.join(staging, "context")
   try:
@@ -320,6 +412,13 @@ def build_image(context_dir: str, tag: str, *, timeout: float = 1200.0) -> ExecR
         context_dir, ctx, symlinks=False,
         ignore=shutil.ignore_patterns("__pycache__"),
     )
+    dockerfile = os.path.join(ctx, "Dockerfile")
+    if mirror and os.path.isfile(dockerfile):
+      _ensure_ar_login(mirror)
+      with open(dockerfile) as f:
+        original = f.read()
+      with open(dockerfile, "w") as f:
+        f.write(_rewrite_dockerfile_for_mirror(original, mirror))
     return _run(
         ["docker", "buildx", "build", "--network=host", "--load", "-t", tag, ctx],
         timeout=timeout,
