@@ -104,6 +104,16 @@ mega = [
   "marin-iris",
   "marin-fray",
 ]
+# Levanter SFT track: drive Levanter directly (ot_agent/levanter_sft.py ->
+# levanter.main.train_lm) for the OpenThoughts-Agent Qwen3 SFT, where Levanter's
+# fused-CE GPU kernel + NVTE flash + sequence packing fit Qwen3 at seq 32768
+# where our hand-rolled tunix path did not. marin-levanter[gpu] is a published
+# PyPI nightly that pins jax[cuda13]==0.10.0 (same as our `gpu` extra) and pulls
+# nvidia-nccl-cu13 + jax-triton + the Triton CE kernel. Launch GPU SFT jobs with
+# `--extra gpu --extra levanter`. Mutually exclusive with `prod` (jax[tpu]).
+levanter = [
+  "marin-levanter[gpu]",
+]
 
 [project.urls]
 Source = "https://github.com/google/tunix"
@@ -140,6 +150,8 @@ prerelease = "allow"
 # both together. Submit TPU jobs with `--extra prod`, GPU jobs with `--extra gpu`.
 conflicts = [
   [{ extra = "prod" }, { extra = "gpu" }],
+  # marin-levanter[gpu] pins jax[cuda13]; incompatible with prod's jax[tpu].
+  [{ extra = "prod" }, { extra = "levanter" }],
 ]
 # google-tunix's pins and the marin nightly wheels disagree on a few transitive
 # deps; these overrides make the combined resolution converge. Mirrors the
@@ -151,6 +163,11 @@ override-dependencies = [
   "wheel>=0.46.2",
   "datasets>=3.1.0,<4.0.0",
   "equinox>=0.11.10",
+  # tunix's orbax-checkpoint>=0.12.0 needs tensorstore>=0.1.84; marin-levanter
+  # conservatively caps tensorstore<0.1.82. Lift the cap so both resolve in one
+  # lock — Levanter's tensorstore usage (zarr3 caches/checkpoints) is exercised
+  # by the levanter SFT smoke to confirm the newer tensorstore is compatible.
+  "tensorstore>=0.1.84",
 ]
 
 [build-system]
