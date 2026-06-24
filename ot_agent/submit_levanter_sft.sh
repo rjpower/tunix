@@ -35,6 +35,9 @@ TS="$(date +%s)"
 NAME="ota-levanter-${OTA_MODEL:-8b}-${TS}"
 
 ENVS=(-e HF_TOKEN "${HF_TOKEN:-}" -e RUN_ID "${NAME}")
+# 32B@32k needs ~61GB/GPU for the train step; XLA's default BFC cap is 0.75*80=60GB
+# -> OOMs by ~1GB. Lift the pool to 0.9 (72GB), leaving ~8GB for NCCL/CUDA context.
+ENVS+=(-e XLA_PYTHON_CLIENT_MEM_FRACTION "${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9}")
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   ENVS+=(-e WANDB_API_KEY "${WANDB_API_KEY}" -e WANDB_PROJECT "${WANDB_PROJECT:-ot-agent}")
 fi
