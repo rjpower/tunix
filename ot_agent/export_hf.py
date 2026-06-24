@@ -170,7 +170,11 @@ def _to_torch_state(model, model_dir: str) -> dict[str, np.ndarray]:
     tk, transform, torch_shape, torch_dtype = nnx_to_torch[nnx_key]
     host = _gather_host(leaf)
     torch_arr = _invert_transform(host, transform, torch_shape)
-    collected[tk] = (torch_arr, torch_dtype)
+    # Cast to the base model's stored dtype (bf16) NOW, not at write time, so
+    # process 0 holds the full state dict at ~64 GB (bf16) rather than ~128 GB
+    # (fp32) for the 32B export. ``host``/``torch_arr`` fp32 transients are freed
+    # each iteration.
+    collected[tk] = _cast(torch_arr, torch_dtype)
     seen_nnx.add(nnx_key)
 
   missing = set(nnx_to_torch) - seen_nnx
@@ -189,17 +193,17 @@ def _cast(arr: np.ndarray, torch_dtype: str) -> np.ndarray:
   return arr.astype(np_dtype)
 
 
-def _write_sharded_safetensors(state: dict[str, tuple], out_dir: str) -> None:
-  """Writes the state dict as HF-convention sharded safetensors + an index."""
+def _write_sharded_safetensors(state: dict[str, np.ndarray], out_dir: str) -> None:
+  """Writes the state dict (arrays already in their stored dtype) as HF-convention
+  sharded safetensors + an index."""
   import safetensors.numpy as safe_np  # noqa: PLC0415
 
   os.makedirs(out_dir, exist_ok=True)
   # Greedy bin-pack keys into ~_SHARD_BYTES shards.
-  items = list(state.items())  # [(torch_key, (arr, dtype_tag))]
   shards: list[list[str]] = [[]]
   sizes = [0]
-  for tk, (arr, dt) in items:
-    nbytes = arr.size * _cast(arr[:0] if arr.size else arr, dt).dtype.itemsize
+  for tk, arr in state.items():
+    nbytes = arr.size * arr.dtype.itemsize
     if sizes[-1] and sizes[-1] + nbytes > _SHARD_BYTES:
       shards.append([])
       sizes.append(0)
@@ -211,7 +215,7 @@ def _write_sharded_safetensors(state: dict[str, tuple], out_dir: str) -> None:
   for i, keys in enumerate(shards):
     fname = (f"model-{i + 1:05d}-of-{total:05d}.safetensors"
              if total > 1 else "model.safetensors")
-    tensors = {tk: _cast(state[tk][0], state[tk][1]) for tk in keys}
+    tensors = {tk: state[tk] for tk in keys}
     safe_np.save_file(tensors, os.path.join(out_dir, fname),
                       metadata={"format": "pt"})
     for tk in keys:
