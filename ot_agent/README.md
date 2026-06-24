@@ -150,9 +150,11 @@ cuDNN attention path first.
 | 32B load + multi-node world on 4×8 H100 | ✅ `LOAD OK` ×4, one `(fsdp=4,tp=8)` world, disjoint data |
 | 32B train-step fit (stock loss) | ❌ OOM — 152k-vocab `[B,S,V]` fp32 loss tensors (→ low-mem loss + grad-accum) |
 | **32B train-step fit + full pipeline (low-mem loss + grad-accum)** | ✅ bigsmoke #2: seq 8192, 30 steps, no OOM, grad_norm↓, gather 707 tensors → 13-shard HF export → R2, exit 0 |
-| full 100K replication at the faithful **seq 32768** | ⛔ **blocked** — tunix has no GPU flash attention (see below) |
+| GPU cuDNN flash attention added to tunix Qwen3 | ✅ flash == materialized logits (CPU `xla` path, `test_gpu_flash_attention.py`) |
+| 32B fit at the faithful **seq 32768** with cuDNN flash (H100) | ⏳ `STAGE=bigsmoke` (seq 32768 + `FLASH=1`) |
+| full 100K replication at seq 32768 | ⏳ scoped run pending (full 5-epoch run is multi-week — see below) |
 
-## ⛔ Blocker for *faithful* replication: context length + GPU flash attention
+## Was-blocked, now-resolved: context length + GPU flash attention
 
 The released `OpenThinkerAgent-32B-SFT-100K` card trains at **`cutoff_len:
 32768`**, and the data demands it — measured token lengths on the 100K set
@@ -164,16 +166,25 @@ The released `OpenThinkerAgent-32B-SFT-100K` card trains at **`cutoff_len:
 | 16384 | 77.6% | 66.6% |
 | 32768 | 9.2% | **98.9%** |
 
-So a faithful run needs ~32k context. But **tunix's Qwen3 flash attention is the
-TPU `splash` pallas kernel only** (`models/qwen3/model.py:27`); on **GPU it falls
-back to materialized `O(seq²)` attention**. At seq 32768 that's ~17 GB/layer even
-TP-sharded, and ~16× the seq-8192 attention FLOPs — a multi-day run on 32×H100,
-memory-fragile. **Resolution (proposed): wire `jax.nn.dot_product_attention(...,
-implementation='cudnn')` as the GPU branch** (cuDNN flash on H100, `O(seq)`
-memory), alongside the TPU splash path. Needed for all long-context GPU work
-here — the faithful SFT *and* the later RL pass. This is a core tunix-suitability
-finding: **tunix does 32B multi-node GPU SFT today, but lacks the GPU flash
-kernel needed for the long-context agentic regime.**
+So a faithful run needs ~32k context. tunix's Qwen3 flash attention *was* the TPU
+`splash` pallas kernel only; on GPU `use_flash_attention` fell back to
+materialized `O(seq²)` attention (~17 GB/layer TP-sharded at 32k, ~16× the
+seq-8192 attention FLOPs) — impossible. **Resolved:** `Attention.block()` now
+dispatches by platform — TPU → splash (unchanged), **GPU → `jax.nn.dot_product_attention(...,
+implementation='cudnn')`** (cuDNN flash, `O(seq)` memory), CPU → `'xla'`. Native
+GQA, `scale=head_dim**-0.5`, `is_causal=True` — equivalent to the materialized
+causal+pad mask on every scored token for unpacked right-padded data (parity in
+`test_gpu_flash_attention.py`). Part of making tunix a viable **GPU and TPU** RL
+target; needed for the faithful SFT *and* the later RL pass.
+
+**The remaining limit is cost, not capability.** Flash makes 32k *fit* and
+not-`O(seq²)`, but the fp32 logits `[B, 32768, 152k]` cap the per-device
+microbatch (~1 seq/device at 32k), so the full **5-epoch / 100K @ 32768** run is
+~118k microbatches → **multi-week on 32×H100**. The faithful headline number needs
+a much larger pod or a scoped demonstration (fewer epochs / a smaller ladder
+point) — a deliberate scope choice. Net suitability verdict so far: **tunix does
+32B multi-node GPU SFT, now with GPU flash attention for long context; the
+blockers were fixable caller-/model-side, not architectural.**
 
 CPU checks:
 ```bash
