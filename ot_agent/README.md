@@ -151,7 +151,9 @@ cuDNN attention path first.
 | 32B train-step fit (stock loss) | ❌ OOM — 152k-vocab `[B,S,V]` fp32 loss tensors (→ low-mem loss + grad-accum) |
 | **32B train-step fit + full pipeline (low-mem loss + grad-accum)** | ✅ bigsmoke #2: seq 8192, 30 steps, no OOM, grad_norm↓, gather 707 tensors → 13-shard HF export → R2, exit 0 |
 | GPU cuDNN flash attention added to tunix Qwen3 | ✅ flash == materialized logits (CPU `xla` path, `test_gpu_flash_attention.py`) |
-| 32B fit at the faithful **seq 32768** with cuDNN flash (H100) | ⏳ `STAGE=bigsmoke` (seq 32768 + `FLASH=1`) |
+| 32B at seq 32768, **low-mem loss** (B=1/device) | ❌ OOM — single 65 GiB alloc, peak 81.5 GB: `logsumexp`+backward still hold ~3 `[B,S,152k]` fp32 tensors at 32k |
+| chunked CE (skip_lm_head + rematerialized per-chunk projection) | ✅ value+grad parity (`test_chunked_loss.py`); **required** to train at 32k, not just an optimization |
+| 32B train at the faithful **seq 32768** with chunked CE + cuDNN flash (H100) | ⏳ `STAGE=bigsmoke` (seq 32768, `CE_CHUNKS=8`, `FLASH=1`) |
 | full 100K replication at seq 32768 | ⏳ scoped run pending (full 5-epoch run is multi-week — see below) |
 
 ## Was-blocked, now-resolved: context length + GPU flash attention
