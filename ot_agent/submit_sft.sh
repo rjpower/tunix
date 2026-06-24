@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Copyright The Marin Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Submit the OT-Agent Qwen3-32B SFT to the CoreWeave H100 cluster (cw-us-east-02a).
+#
+# Multi-node is one flag: `iris job run --replicas N` auto-enables `leafgroup`
+# coscheduling for GPUs (all N pods land on one InfiniBand fabric and form one
+# JAX world via ot_agent.distributed.init_distributed). The entrypoint is
+# `python -m ot_agent.launch_sft`, configured entirely by `-e` env vars.
+#
+# Three rungs of a smoke ladder (run them in order before the full run):
+#   STAGE=single   1 node (8 H100), Qwen3-1.7B  -- validates the SFT loop + export
+#   STAGE=multi    2 nodes,         Qwen3-1.7B  -- validates the multi-node JAX
+#                                                  world + process-disjoint data
+#   STAGE=full     4 nodes (32 H100), Qwen3-32B -- the 100K replication run
+#
+# Usage:
+#   export HF_TOKEN=...                         # gated/large HF pulls on the worker
+#   export WANDB_API_KEY=... WANDB_PROJECT=ot-agent   # optional loss curve
+#   STAGE=single bash ot_agent/submit_sft.sh
+#   STAGE=multi  bash ot_agent/submit_sft.sh
+#   STAGE=full   bash ot_agent/submit_sft.sh
+#
+# Watch:
+#   uv run iris --cluster=cw-us-east-02a job summary /power/<job-name>
+#   uv run iris --cluster=cw-us-east-02a job logs    /power/<job-name> --follow | grep '\[ota-'
+set -euo pipefail
+
+STAGE="${STAGE:-single}"
+CLUSTER="cw-us-east-02a"
+# R2 prefix for the exported HF checkpoint (the coherent downstream artifact).
+EXPORT_BASE="${EXPORT_BASE:-s3://marin-na/users/power/ot-agent}"
+TS="$(date +%s)"
+
+IRIS=(uv run iris --cluster="${CLUSTER}" job run --no-wait
+  --enable-extra-resources --extra gpu --extra mega)
+
+# Forward secrets the worker needs (HF pulls; optional wandb).
+ENVS=(-e HF_TOKEN "${HF_TOKEN:-}")
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+  ENVS+=(-e WANDB_API_KEY "${WANDB_API_KEY}" -e WANDB_PROJECT "${WANDB_PROJECT:-ot-agent}")
+fi
+
+case "${STAGE}" in
+  single)
+    # 1 node, tiny model, tiny data: shake out the loop + export end-to-end.
+    NAME="ota-sft-smoke-single-${TS}"
+    "${IRIS[@]}" --gpu H100x8 --cpu 16 --memory 200GB --disk 100GB --max-retries 0 \
+      --job-name "${NAME}" "${ENVS[@]}" \
+      -e AGENT_MODEL qwen3-1.7b-base -e DATASET 1k -e DATA_LIMIT 512 \
+      -e SFT_STEPS 20 -e BATCH_SIZE 8 -e TP 1 -e MAX_SEQ_LEN 2048 -e REMAT decoder \
+      -e EXPORT_DIR "${EXPORT_BASE}/smoke-single-${TS}/hf" \
+      -- python -m ot_agent.launch_sft
+    ;;
+  multi)
+    # 2 nodes (16 H100): the multi-node JAX world + disjoint data-parallel path.
+    NAME="ota-sft-smoke-multi-${TS}"
+    "${IRIS[@]}" --gpu H100x8 --replicas 2 --cpu 16 --memory 200GB --disk 100GB --max-retries 0 \
+      --job-name "${NAME}" "${ENVS[@]}" \
+      -e AGENT_MODEL qwen3-1.7b-base -e DATASET 10k -e DATA_LIMIT 4096 \
+      -e SFT_STEPS 30 -e BATCH_SIZE 16 -e TP 8 -e MAX_SEQ_LEN 2048 -e REMAT decoder \
+      -e EXPORT_DIR "${EXPORT_BASE}/smoke-multi-${TS}/hf" \
+      -- python -m ot_agent.launch_sft
+    ;;
+  full)
+    # 4 nodes (32 H100): Qwen3-32B on the 100K set -- the replication run.
+    # global BATCH_SIZE 32 -> 8/node; fsdp=4, tp=8; ~3 epochs of 94.3k @ bs32
+    # is ~8800 steps. Tune SFT_STEPS/LR per the paper's recipe.
+    NAME="ota-sft-qwen3-32b-100k-${TS}"
+    "${IRIS[@]}" --gpu H100x8 --replicas 4 --cpu 32 --memory 512GB --disk 300GB --max-retries 1 \
+      --job-name "${NAME}" "${ENVS[@]}" \
+      -e AGENT_MODEL qwen3-32b -e DATASET 100k \
+      -e SFT_STEPS "${SFT_STEPS:-8800}" -e BATCH_SIZE "${BATCH_SIZE:-32}" \
+      -e LR "${LR:-1e-5}" -e TP "${TP:-8}" -e MAX_SEQ_LEN "${MAX_SEQ_LEN:-8192}" \
+      -e REMAT "${REMAT:-decoder}" -e RUN_NAME "${NAME}" \
+      -e EXPORT_DIR "${EXPORT_BASE}/qwen3-32b-100k-${TS}/hf" \
+      -- python -m ot_agent.launch_sft
+    ;;
+  *)
+    echo "unknown STAGE='${STAGE}' (want: single|multi|full)" >&2
+    exit 2
+    ;;
+esac
+
+echo "submitted STAGE=${STAGE} as /power/${NAME}"
+echo "watch: uv run iris --cluster=${CLUSTER} job logs /power/${NAME} --follow | grep '\\[ota-'"
