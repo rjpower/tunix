@@ -35,9 +35,15 @@ TS="$(date +%s)"
 NAME="ota-levanter-${OTA_MODEL:-8b}-${TS}"
 
 ENVS=(-e HF_TOKEN "${HF_TOKEN:-}" -e RUN_ID "${NAME}")
-# 32B@32k needs ~61GB/GPU for the train step; XLA's default BFC cap is 0.75*80=60GB
-# -> OOMs by ~1GB. Lift the pool to 0.9 (72GB), leaving ~8GB for NCCL/CUDA context.
-ENVS+=(-e XLA_PYTHON_CLIENT_MEM_FRACTION "${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9}")
+# 32B@32k: the train step needs ~61GB/GPU (< 80GB physical), but the HF-load +
+# opt-state-init + first-step-compile phase transiently stacks load buffers on top
+# of the optimizer state. With XLA's default preallocation that transient slams
+# into the fixed BFC wall and OOMs mid-load. PREALLOCATE=false lets the load
+# buffers be freed and the memory reused for the step, sharing the full card
+# dynamically; MEM_FRACTION then just caps growth (0.93*80=74.4GB, ~5.6GB left for
+# NCCL/CUDA context). 8B (1 node, ample headroom) is unaffected.
+ENVS+=(-e XLA_PYTHON_CLIENT_PREALLOCATE "${XLA_PYTHON_CLIENT_PREALLOCATE:-false}")
+ENVS+=(-e XLA_PYTHON_CLIENT_MEM_FRACTION "${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.93}")
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   ENVS+=(-e WANDB_API_KEY "${WANDB_API_KEY}" -e WANDB_PROJECT "${WANDB_PROJECT:-ot-agent}")
 fi
