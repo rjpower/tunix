@@ -302,9 +302,8 @@ def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
     """
     import haliax
     import jax
-    import equinox as eqx
     import levanter.compat.hf_checkpoints as hfc
-    from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
+    from levanter.checkpoint import discover_latest_checkpoint, load_checkpoint
 
     orig = hfc.HFCheckpointConverter.load_pretrained
     if getattr(orig, "_ota_ckpt_patched", False):
@@ -317,7 +316,11 @@ def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
         if config is None:
             config = self.config_from_hf_config(self.hf_config_from_hf_checkpoint(ref))
         Vocab = self.Vocab  # tokenizer vocab (151669) == the converted checkpoint's
-        path = latest_checkpoint_path(ckpt_path) or ckpt_path
+        # export_hf_to_lm writes the model tree directly to ckpt_path (step=0, no
+        # step-N subdir). discover_latest_checkpoint returns None if there's no
+        # step-subdir layout, so fall back to the bare path. (latest_checkpoint_path
+        # would *raise* instead of returning None -- don't use it here.)
+        path = discover_latest_checkpoint(ckpt_path) or ckpt_path
         logger.info("OTA warm-start: loading Levanter checkpoint %s into the 2D layout", path)
         template = config.build(Vocab, key=jax.random.PRNGKey(0))
         model = load_checkpoint(template, path, axis_mapping=axis_mapping)
