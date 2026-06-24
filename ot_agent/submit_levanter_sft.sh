@@ -78,7 +78,7 @@ if [[ "${REPLICAS}" -gt 1 ]]; then REPLICA_ARGS=(--replicas "${REPLICAS}"); fi
 echo "submitting ${NAME}: model=${OTA_MODEL:-8b} dataset=${OTA_DATASET:-OT-Agent-1K} seq=${OTA_SEQ:-32768} steps=${OTA_STEPS:-40} output=${OTA_OUTPUT}"
 uv run iris --cluster="${CLUSTER}" job run --no-wait \
   --enable-extra-resources --extra gpu --extra levanter \
-  --gpu "${GPUS}" "${REPLICA_ARGS[@]}" --cpu 32 --memory 256GB --disk 512GB --max-retries 0 \
+  --gpu "${GPUS}" "${REPLICA_ARGS[@]}" --cpu 32 --memory "${MEM:-256GB}" --disk 512GB --max-retries 0 \
   --job-name "${NAME}" "${ENVS[@]}" \
   -- "${ENTRYPOINT[@]}"
 
