@@ -62,10 +62,12 @@ for v in OTA_MODEL OTA_DATASET OTA_SEQ OTA_BATCH OTA_PDP OTA_TP OTA_STEPS OTA_LR
   if [[ -n "${!v:-}" ]]; then ENVS+=(-e "$v" "${!v}"); fi
 done
 
-# Entrypoint: the one-time HF->Levanter checkpoint conversion (OTA_CONVERT=1, runs
-# wholly on CPU so it can't OOM the GPUs -- 1 node suffices) or the SFT trainer.
+# Entrypoint: the one-time HF->Levanter checkpoint conversion (OTA_CONVERT=1) or
+# the SFT trainer. The convert runs ON the GPUs at TP=1 (pure FSDP): every weight
+# shards over `data` and inputs stream in already-sharded, so ~20GB/GPU with no
+# optimizer state -- 1 node (8xH100) suffices. (The old CPU path needed >300GB host
+# RAM because a 1-device CPU mesh can't shard; see convert_hf_to_levanter.py.)
 if [[ "${OTA_CONVERT:-0}" == "1" ]]; then
-  ENVS+=(-e JAX_PLATFORMS cpu)   # force the convert onto host RAM (no CUDA init)
   ENTRYPOINT=(python -m ot_agent.convert_hf_to_levanter)
 else
   ENTRYPOINT=(python -m ot_agent.levanter_sft)

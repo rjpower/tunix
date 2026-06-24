@@ -7,37 +7,65 @@
 # ---------------
 # Qwen3-32B at seq 32768 fits the *train step* on 32xH100 only with 2D sharding
 # (TP=8 over NVLink + FSDP over the rest; see ot_agent/levanter_sft.py). But the
-# one-shot HF->2D-sharded weight load is a different problem: Levanter converts the
-# whole 64GB safetensors state dict to the 2D layout inside a single named_jit
-# (all 64 layers + the GQA q/k/v reshapes at once), and that reshard transient
-# (~52GB) stacked on the ~22GB optimizer state blows past 80GB -> OOM mid-load.
-# At TP=1 (1D) the load is clean but the *train step* then OOMs on a replicated
-# 50GB activation. There is no single mesh that clears both phases.
+# one-shot HF->2D-sharded weight load is a different problem: when the trainer has
+# already built the ~22GB optimizer state, the monolithic HF->2D conversion jit's
+# ~52GB reshard transient stacked on top exceeds 80GB -> OOM mid-load. There is no
+# single mesh that clears both that load *and* the train step.
 #
-# THE FIX: decouple the expensive HF conversion from training. Levanter's
-# `export_hf_to_lm` loads the HF model on the CPU (`use_cpu_device()`, host RAM is
-# 256GB so it never touches device memory) and writes a Tensorstore checkpoint.
-# The SFT run then warm-starts from that checkpoint via `trainer.initialize_from`
-# (+ allow_partial_checkpoint), which deserializes each array straight into the 2D
-# device layout per-array (gentle, ~24GB peak) -- no monolithic conversion jit.
+# THE FIX: decouple the HF conversion from training. Convert HF -> a Levanter
+# Tensorstore checkpoint ONCE, with NO optimizer state and NO activations in play,
+# then have the SFT run warm-start from it via a gentle per-array tensorstore load
+# into the 2D layout (ot_agent/levanter_sft.py::_patch_load_pretrained_from_checkpoint).
 #
-# Usage (one node is plenty -- the load is CPU-bound, the save streams to R2):
-#   OTA_MODEL=32b \
+# HOW THE CONVERT ITSELF AVOIDS OOM (the important part)
+# -----------------------------------------------------
+# Levanter's loader is already sharding-aware: `_load_safe_tensors` streams each
+# safetensors tensor from R2/HF and `device_put`s it sharded over the active mesh's
+# `data` axis (`best_effort_sharding`), and `load_pretrained` builds the model
+# inside a `named_jit` whose outputs shard per the axis mapping. So under a real
+# multi-GPU mesh, NOTHING is ever materialized whole on one device.
+#
+# The earlier CPU version (`use_cpu_device()` / JAX_PLATFORMS=cpu) defeated exactly
+# this: a 1-device CPU "mesh" can't shard, so the 64GB state_dict + the 64GB model
+# build + the GQA q/k/v reshape and resize-vocab intermediates ALL piled into host
+# RAM at once (>300GB) -> OOMKilled even at a 256GB cap, and "fixing" it with
+# MEM=1800GB just made the job unschedulable. The model is 64GB; converting it
+# should never need 1800GB of anything.
+#
+# So we run the convert on ONE 8xH100 node at TP=1 (pure FSDP, mesh data=8/model=1).
+# Every Qwen3 weight shards 8-way over `data` (the embed/feature dim or the stacked
+# block axis), inputs stream in already-sharded, there's no optimizer state and no
+# activations (a convert runs no train step -- which is why TP=1 is clean here even
+# though a TP=1 *train step* would OOM on a replicated activation). Peak ~20GB/GPU.
+# Single host => no jax.distributed setup. The saved checkpoint is sharding-agnostic,
+# so training warm-starts it at TP=8/2D regardless of the mesh used to write it.
+#
+# Usage (one 8xH100 node is plenty; the convert takes a few minutes):
+#   OTA_MODEL=32b OTA_CONVERT=1 REPLICAS=1 \
 #   OTA_CONVERT_OUTPUT=s3://marin-na/users/power/ot-agent-levanter/qwen3-32b-base-levanter \
-#   python -m ot_agent.convert_hf_to_levanter
+#   bash ot_agent/submit_levanter_sft.sh
 #
 # The resulting path is then passed to the SFT launcher as OTA_INIT_FROM.
 
 import logging
-import os
+import time
 
 import jax
+import jax.numpy as jnp
+from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
 
+from haliax.partitioning import set_mesh
+
+from levanter.checkpoint import save_checkpoint
+from levanter.compat.hf_checkpoints import RepoRef, load_tokenizer
 from levanter.main import export_hf_to_lm
+from levanter.utils.fsspec_utils import mkdirs
+from levanter.utils.mesh import MeshConfig, create_mesh_from_axis_specs
 
 from ot_agent.levanter_sft import _env, _qwen3_8b, _qwen3_32b_real
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def build_config() -> export_hf_to_lm.ImportHfConfig:
@@ -74,23 +102,67 @@ def build_config() -> export_hf_to_lm.ImportHfConfig:
     )
 
 
-if __name__ == "__main__":
-    # Run wholly on CPU (host RAM, set via JAX_PLATFORMS=cpu in the submit script):
-    # the 64GB conversion never touches device memory, so this can't OOM the GPUs.
-    import numpy as np
-    from jax.sharding import Mesh
-    from haliax.partitioning import set_mesh
+def _build_fsdp_mesh():
+    """A single-node, pure-FSDP mesh (data=all local GPUs, model=1) + its param mapping.
 
-    cfg = build_config()
-    devices = jax.devices()
-    logging.info("HF->Levanter convert: %s -> %s", cfg.hf_checkpoint, cfg.output_path)
-    logging.info("jax devices: %s", devices)
+    TP=1 keeps the load clean (every weight shards over `data`, inputs stream in
+    already sharded; see module docstring). We still set kv_head->model in the
+    mapping for parity with the train config -- it's a no-op at model=1.
+    """
+    num_devices = jax.device_count()
+    mesh_cfg = MeshConfig(
+        axes={"replica": 1, "data": -1, "model": 1},
+        param_mapping={"embed": "data", "kv_head": "model"},
+        compute_mapping={"kv_head": "model"},
+    )
+    ici_axes, dcn_axes = mesh_cfg.axis_shapes(num_devices=num_devices, num_slices=1)
+    mesh = create_mesh_from_axis_specs(ici_axes=ici_axes, dcn_axes=dcn_axes)
+    return mesh, mesh_cfg.resolved_param_mapping
 
-    # Levanter's safetensors loader shards each tensor via best_effort_sharding,
-    # which reads mesh.shape["data"] -- so it needs a mesh that actually HAS a
-    # "data" axis (otherwise KeyError 'data'). export_hf_to_lm doesn't set one up,
-    # so establish a trivial 1-device (replica, data, model) mesh here; data=1 makes
-    # best_effort_sharding a no-op (replicated on the single CPU device).
-    mesh = Mesh(np.asarray(devices[:1]).reshape(1, 1, 1), ("replica", "data", "model"))
+
+def convert(cfg: export_hf_to_lm.ImportHfConfig) -> None:
+    start = time.time()
+    hf_ref = cfg.hf_checkpoint if isinstance(cfg.hf_checkpoint, RepoRef) else RepoRef.from_string(cfg.hf_checkpoint)
+    logger.info("HF->Levanter convert: %s -> %s", hf_ref, cfg.output_path)
+    logger.info("jax devices: %s", jax.devices())
+
+    mesh, param_mapping = _build_fsdp_mesh()
+    logger.info("convert mesh axes=%s param_mapping=%s", dict(mesh.shape), param_mapping)
+
+    tokenizer = load_tokenizer(hf_ref.model_name_or_path)
+    converter = cfg.model.hf_checkpoint_converter()
+    converter = converter.replaced(reference_checkpoint=hf_ref, tokenizer=tokenizer)
+
+    dtype = getattr(jnp, cfg.dtype) if cfg.dtype else None
     with set_mesh(mesh):
-        export_hf_to_lm.main(cfg)
+        # load_state_dict (inside load_pretrained) streams each safetensors tensor
+        # sharded over `data`; the named_jit builds the model sharded per
+        # param_mapping. Nothing is ever whole on one device.
+        model = converter.load_pretrained(
+            cfg.model.model_type,
+            config=cfg.model if not cfg.use_hf_model_config else None,
+            axis_mapping=param_mapping,
+            resize_vocab_to_match_tokenizer=cfg.resize_vocab_to_match_tokenizer,
+            dtype=dtype,
+        )
+
+        mkdirs(cfg.output_path)
+        logger.info("Saving Levanter checkpoint (step=0) to %s", cfg.output_path)
+        manager = GlobalAsyncCheckpointManager()
+
+        def _committed():
+            logger.info("Checkpoint committed to Tensorstore. Total time: %.1fs", time.time() - start)
+
+        save_checkpoint(
+            tree=model,
+            checkpoint_path=cfg.output_path,
+            manager=manager,
+            commit_callback=_committed,
+            step=0,
+            is_temporary=False,
+        )
+    logger.info("Conversion completed successfully!")
+
+
+if __name__ == "__main__":
+    convert(build_config())
