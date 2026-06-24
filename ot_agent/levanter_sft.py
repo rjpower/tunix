@@ -207,11 +207,50 @@ def build_config() -> train_lm.TrainLmConfig:
         optimizer=optimizer,
         train_seq_len=seq_len,
         initialize_from_hf=base_ckpt,
-        pad_tokenizer_to_match_model=True,  # Qwen pads embed vocab past the tokenizer
+        # NB: pad_tokenizer_to_match_model is intentionally False; see
+        # _patch_levanter_vocab_resize for the Qwen padded-vocab story.
+        pad_tokenizer_to_match_model=False,
         hf_save_path=f"{run_dir}/hf",
         hf_save_steps=hf_export,
     )
 
 
+def _patch_levanter_vocab_resize() -> None:
+    """Resize the HF model down to the tokenizer vocab on load (Qwen padded-vocab fix).
+
+    Qwen3's HF embedding is padded to 151936, but the Qwen3 tokenizer only has
+    151669 real tokens (ids 151669..151935 are never emitted). Levanter's
+    train_lm builds the optimizer state from ``len(config.data.the_tokenizer)``
+    (= 151669) via ``trainer.initial_state``, but ``initialize_from_hf`` then loads
+    the model at the HF size (151936) and swaps only the model into the state --
+    the opt state is never rebuilt. The first ``optimizer.update`` then raises a
+    vocab-axis pytree mismatch (151936 vs 151669).
+
+    ``pad_tokenizer_to_match_model=True`` does NOT fix this: it pads a *copy* of
+    the tokenizer held by the HF converter (``as_hf_tokenizer`` + dataclasses
+    .replace), not the shared ``the_tokenizer`` that drives the Vocab axis. The
+    robust fix is to resize the loaded model *down* to the tokenizer vocab so the
+    model and opt state agree at 151669; the dropped rows are unused padding.
+    ``HFCheckpointConverter.load_pretrained`` supports this via
+    ``resize_vocab_to_match_tokenizer`` but ``TrainLmConfig`` doesn't expose it,
+    so flip its default here. ``vocab`` is absent from our ``param_mapping`` so the
+    axis is unsharded and ``round_axis_for_partitioning`` is a no-op (151669 for
+    any mesh) -- consistent for the 8B smoke and the 32B/TP run alike.
+    """
+    import levanter.compat.hf_checkpoints as hfc
+
+    orig = hfc.HFCheckpointConverter.load_pretrained
+    if getattr(orig, "_ota_resize_patched", False):
+        return
+
+    def patched(self, *args, **kwargs):
+        kwargs.setdefault("resize_vocab_to_match_tokenizer", True)
+        return orig(self, *args, **kwargs)
+
+    patched._ota_resize_patched = True
+    hfc.HFCheckpointConverter.load_pretrained = patched
+
+
 if __name__ == "__main__":
+    _patch_levanter_vocab_resize()
     train_lm.main(build_config())
