@@ -73,12 +73,16 @@ case "${STAGE}" in
     # O(seq). Small per-device microbatch (global 4 -> 1/device on fsdp=4) +
     # grad-accum, low-mem loss on. Watch the XLA peak-HBM line to size the full
     # run's per-step batch + estimate throughput at 32k.
+    # All knobs overridable via env so perf variants don't need an edit, e.g.:
+    #   CE_CHUNKS=8 BATCH_SIZE=16 GRAD_ACCUM=1 STAGE=bigsmoke bash ot_agent/submit_sft.sh
     NAME="ota-sft-bigsmoke-32b-${TS}"
     "${IRIS[@]}" --gpu H100x8 --replicas 4 --cpu 32 --memory 512GB --disk 300GB --max-retries 0 \
       --job-name "${NAME}" "${ENVS[@]}" \
-      -e AGENT_MODEL qwen3-32b -e DATASET 10k -e DATA_LIMIT 512 \
-      -e SFT_STEPS 12 -e BATCH_SIZE 4 -e GRAD_ACCUM 2 -e LR 1e-5 -e TP 8 \
-      -e MAX_SEQ_LEN 32768 -e FLASH 1 -e REMAT decoder -e RUN_NAME "${NAME}" \
+      -e AGENT_MODEL qwen3-32b -e DATASET 10k -e DATA_LIMIT "${DATA_LIMIT:-512}" \
+      -e SFT_STEPS "${SFT_STEPS:-12}" -e BATCH_SIZE "${BATCH_SIZE:-4}" \
+      -e GRAD_ACCUM "${GRAD_ACCUM:-2}" -e CE_CHUNKS "${CE_CHUNKS:-0}" \
+      -e LR 1e-5 -e TP "${TP:-8}" -e MAX_SEQ_LEN "${MAX_SEQ_LEN:-32768}" \
+      -e FLASH "${FLASH:-1}" -e REMAT "${REMAT:-decoder}" -e RUN_NAME "${NAME}" \
       -e EXPORT_DIR "${EXPORT_BASE}/bigsmoke-32b-${TS}/hf" \
       -- python -m ot_agent.launch_sft
     ;;
@@ -97,7 +101,7 @@ case "${STAGE}" in
       --job-name "${NAME}" "${ENVS[@]}" \
       -e AGENT_MODEL qwen3-32b -e DATASET "${DATASET:-100k}" \
       -e SFT_STEPS "${SFT_STEPS:-4914}" -e BATCH_SIZE "${BATCH_SIZE:-4}" \
-      -e GRAD_ACCUM "${GRAD_ACCUM:-24}" \
+      -e GRAD_ACCUM "${GRAD_ACCUM:-24}" -e CE_CHUNKS "${CE_CHUNKS:-8}" \
       -e LR "${LR:-4e-5}" -e WARMUP_RATIO "${WARMUP_RATIO:-0.1}" \
       -e TP "${TP:-8}" -e MAX_SEQ_LEN "${MAX_SEQ_LEN:-32768}" -e FLASH "${FLASH:-1}" \
       -e REMAT "${REMAT:-decoder}" -e RUN_NAME "${NAME}" \

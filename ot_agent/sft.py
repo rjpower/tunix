@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
+from flax import nnx
 
 from tunix.sft.peft_trainer import PeftTrainer, TrainingConfig
 
@@ -71,6 +72,85 @@ def low_mem_cross_entropy_loss(
   return -jnp.sum(token_logp * target_mask.astype(token_logp.dtype)) * norm_factor
 
 
+def _chunk_nll(model, hidden_chunk, target_chunk, mask_chunk):
+  """Projects one sequence-chunk of hidden states to logits and sums masked NLL.
+
+  Returns ``(-sum(logp*mask), sum(mask))`` for the chunk. Kept as a standalone
+  fn so it can be wrapped in ``nnx.remat`` -- the backward then recomputes this
+  chunk's ``[B, c, V]`` logits instead of stashing them, which is the whole point.
+  """
+  logits = model.compute_final_logits(hidden_chunk)  # [B, c, V] (fp32)
+  log_z = jax.nn.logsumexp(logits, axis=-1)  # [B, c]
+  target_logit = jnp.take_along_axis(
+      logits, target_chunk[..., None], axis=-1
+  )[..., 0]
+  logp = target_logit - log_z
+  m = mask_chunk.astype(logp.dtype)
+  return -jnp.sum(logp * m), jnp.sum(m)
+
+
+def chunked_cross_entropy_loss(
+    model,
+    input_tokens: jax.Array,
+    input_mask: jax.Array,
+    positions: jax.Array,
+    attention_mask: jax.Array,
+    images: jax.Array | None = None,
+    *,
+    n_chunks: int = 8,
+):
+  """Memory-lean CE that never materializes the full ``[B, S, V]`` logits.
+
+  Same NLL as :func:`low_mem_cross_entropy_loss` / tunix's ``_default_loss_fn``,
+  but runs the transformer once with ``skip_lm_head=True`` (hidden states are
+  tiny: ``[B, S, D]``) and then projects + scores the sequence in ``n_chunks``
+  pieces, each wrapped in ``nnx.remat``. Peak logit memory drops from
+  ``[B, S, V]`` to ``[B, S/n_chunks, V]`` -- at Qwen3-32B / seq 32768 that's the
+  20-40 GB fp32 logit tensor that cornered training at 1 seq/device; chunking it
+  lets the per-device microbatch grow (fewer grad-accum steps, higher MFU). The
+  lm_head matmul is recomputed in the backward (cheap relative to the 32B body).
+  ``test_chunked_loss.py`` pins value+gradient parity against the stock loss.
+  """
+  kwargs = {} if images is None else {"images": images}
+  hidden, _ = model(
+      input_tokens, positions, None, attention_mask, skip_lm_head=True, **kwargs
+  )
+  hidden = hidden[:, :-1, :]
+  targets = input_tokens[:, 1:]
+  mask = input_mask[:, 1:]
+
+  s = hidden.shape[1]
+  n = max(1, min(n_chunks, s))
+  chunk = -(-s // n)  # ceil division -> static bounds (s is a static trace dim)
+  scored = nnx.remat(_chunk_nll)
+
+  total_nll = jnp.array(0.0, jnp.float32)
+  total_tok = jnp.array(0.0, jnp.float32)
+  for i in range(0, s, chunk):
+    j = min(i + chunk, s)
+    nll, tok = scored(model, hidden[:, i:j, :], targets[:, i:j], mask[:, i:j])
+    total_nll += nll.astype(jnp.float32)
+    total_tok += tok.astype(jnp.float32)
+  return total_nll / (total_tok + 1e-8)
+
+
+def make_chunked_cross_entropy_loss(n_chunks: int):
+  """Bind ``n_chunks`` via a closure with the canonical loss-fn signature.
+
+  ``functools.partial`` would leave ``n_chunks`` as a keyword-only param, which
+  breaks nnx's ``resolve_kwargs`` -- ``PeftTrainer`` calls the loss as
+  ``grad_fn(model, **inputs)``, and nnx maps those kwargs to *positional* params.
+  A plain closure with positional ``(model, input_tokens, input_mask, positions,
+  attention_mask, images)`` resolves cleanly.
+  """
+  def loss(model, input_tokens, input_mask, positions, attention_mask, images=None):
+    return chunked_cross_entropy_loss(
+        model, input_tokens, input_mask, positions, attention_mask, images,
+        n_chunks=n_chunks,
+    )
+  return loss
+
+
 def build_optimizer(peak_lr: float, total_steps: int, warmup_ratio: float = 0.0):
   """Global-norm-clipped AdamW, optionally with a cosine+warmup LR schedule.
 
@@ -107,6 +187,7 @@ def run_sharded_sft(
     warmup_ratio: float = 0.0,
     grad_accum: int = 1,
     low_mem_loss: bool = True,
+    ce_chunks: int = 0,
     checkpoint_dir: str | None = None,
     save_interval_secs: int = 600,
     max_to_keep: int = 2,
@@ -126,8 +207,12 @@ def run_sharded_sft(
       tunix runs ``steps * grad_accum`` microbatches, so the effective (global)
       batch = per-step global batch * grad_accum. Lets a small per-device
       microbatch (which bounds the activation peak) reach a large effective batch.
-    low_mem_loss: use :func:`low_mem_cross_entropy_loss` (default) instead of
-      tunix's one-hot loss -- required to fit 32B's loss over the 152k vocab.
+    low_mem_loss: use :func:`low_mem_cross_entropy_loss` instead of tunix's
+      one-hot loss -- required to fit 32B's loss over the 152k vocab. Ignored
+      when ``ce_chunks > 0`` (chunked CE supersedes it).
+    ce_chunks: if >0, use :func:`chunked_cross_entropy_loss` with this many
+      sequence chunks -- never materializes the full ``[B, S, V]`` logits, so the
+      per-device microbatch can grow (needed for long context, e.g. seq 32768).
     checkpoint_dir: orbax checkpoint root (local or ``gs://``); ``None`` disables.
       NB: on the CW GPU cluster there is no shared filesystem across nodes, so a
       multi-node run should checkpoint to ``None`` here and rely on the post-run
@@ -163,11 +248,17 @@ def run_sharded_sft(
       ),
   )
   trainer.with_gen_model_input_fn(sft_model_input_fn)
-  if low_mem_loss:
+  if ce_chunks and ce_chunks > 0:
+    loss_name = f"chunked_ce(n={ce_chunks})"
+    trainer.with_loss_fn(make_chunked_cross_entropy_loss(ce_chunks), has_aux=False)
+  elif low_mem_loss:
+    loss_name = "low_mem"
     trainer.with_loss_fn(low_mem_cross_entropy_loss, has_aux=False)
+  else:
+    loss_name = "default"
   print(
       f"[ota-sft] steps={steps} lr={learning_rate} grad_accum={grad_accum} "
-      f"low_mem_loss={low_mem_loss} ckpt={checkpoint_dir} "
+      f"loss={loss_name} ckpt={checkpoint_dir} "
       f"process={jax.process_index()}/{jax.process_count()}",
       flush=True,
   )

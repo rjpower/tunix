@@ -29,6 +29,10 @@ Config via env (all optional unless noted):
   * ``LOW_MEM_LOSS`` (1) -- use the gather-based cross-entropy instead of tunix's
     one-hot loss; required to fit the 32B loss over the 152k vocab. Set 0 only
     to A/B against the stock loss on a small model.
+  * ``CE_CHUNKS`` (0) -- if >0, use the chunked CE (this many sequence chunks):
+    runs the body with skip_lm_head then projects+scores in chunks (rematerialized),
+    so the full ``[B,S,V]`` logits never materialize. Lets the per-device
+    microbatch grow at long context (e.g. seq 32768). Supersedes LOW_MEM_LOSS.
   * ``WARMUP_RATIO`` (0.0 = constant LR; the paper uses 0.1 = cosine schedule
     with linear warmup over the first 10% of steps then cosine decay to ~0).
   * ``MAX_SEQ_LEN`` (8192), ``SEED`` (0), ``TP`` (8; tensor-parallel width,
@@ -96,6 +100,7 @@ def main() -> None:
   learning_rate = float(os.environ.get("LR", "1e-5"))
   warmup_ratio = float(os.environ.get("WARMUP_RATIO", "0.0"))
   low_mem_loss = os.environ.get("LOW_MEM_LOSS", "1") == "1"
+  ce_chunks = int(os.environ.get("CE_CHUNKS", "0"))
   max_seq_len = int(os.environ.get("MAX_SEQ_LEN", "8192"))
   seed = int(os.environ.get("SEED", "0"))
   tp = int(os.environ.get("TP", "8"))
@@ -195,6 +200,7 @@ def main() -> None:
       warmup_ratio=warmup_ratio,
       grad_accum=grad_accum,
       low_mem_loss=low_mem_loss,
+      ce_chunks=ce_chunks,
       checkpoint_dir=checkpoint_dir,
       metrics_options=metrics,
   )
