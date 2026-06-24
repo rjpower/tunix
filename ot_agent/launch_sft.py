@@ -20,7 +20,15 @@ Config via env (all optional unless noted):
   * ``AGENT_MODEL`` (qwen3-32b) -- registry key. ``AGENT_MODEL_DIR`` (./<name>).
   * ``DATASET`` (100k) -- OT-Agent ladder key (1k|3.16k|10k|31.6k|100k|
     coldstart-10k|v1) or a full HF dataset id. ``DATASET_REVISION`` (default branch).
-  * ``SFT_STEPS`` (2000), ``BATCH_SIZE`` (32, the GLOBAL batch), ``LR`` (1e-5).
+  * ``SFT_STEPS`` (2000, OPTIMIZER steps), ``BATCH_SIZE`` (32, the GLOBAL
+    per-step batch), ``LR`` (1e-5).
+  * ``GRAD_ACCUM`` (1) -- gradient-accumulation steps. Effective (global) batch
+    = ``BATCH_SIZE * GRAD_ACCUM``; the per-step ``BATCH_SIZE`` bounds the
+    activation peak (use a small per-device microbatch + GRAD_ACCUM to reach a
+    large effective batch on 32B without OOM).
+  * ``LOW_MEM_LOSS`` (1) -- use the gather-based cross-entropy instead of tunix's
+    one-hot loss; required to fit the 32B loss over the 152k vocab. Set 0 only
+    to A/B against the stock loss on a small model.
   * ``WARMUP_RATIO`` (0.0 = constant LR; the paper uses 0.1 = cosine schedule
     with linear warmup over the first 10% of steps then cosine decay to ~0).
   * ``MAX_SEQ_LEN`` (8192), ``SEED`` (0), ``TP`` (8; tensor-parallel width,
@@ -82,8 +90,10 @@ def main() -> None:
   dataset_revision = os.environ.get("DATASET_REVISION") or None
   steps = int(os.environ.get("SFT_STEPS", "2000"))
   global_batch = int(os.environ.get("BATCH_SIZE", "32"))
+  grad_accum = int(os.environ.get("GRAD_ACCUM", "1"))
   learning_rate = float(os.environ.get("LR", "1e-5"))
   warmup_ratio = float(os.environ.get("WARMUP_RATIO", "0.0"))
+  low_mem_loss = os.environ.get("LOW_MEM_LOSS", "1") == "1"
   max_seq_len = int(os.environ.get("MAX_SEQ_LEN", "8192"))
   seed = int(os.environ.get("SEED", "0"))
   tp = int(os.environ.get("TP", "8"))
@@ -107,7 +117,11 @@ def main() -> None:
         f"({fsdp} = device_count {device_count} // TP {tp})."
     )
   per_process_batch = per_process_batch_size(global_batch, process_count)
-  n_per_process = rows_per_process(steps, per_process_batch)
+  # tunix runs steps*grad_accum microbatches; each consumes per_process_batch
+  # rows/process, so the process must buffer that many. Effective (global) batch
+  # = global_batch * grad_accum.
+  n_per_process = rows_per_process(steps * grad_accum, per_process_batch)
+  effective_batch = global_batch * grad_accum
 
   repo_id = resolve_repo(dataset_key)
   if dataset_revision is None:
@@ -120,8 +134,10 @@ def main() -> None:
           f"devices={device_count} mesh=(fsdp={fsdp},tp={tp})", flush=True)
     print(
         f"[ota-sft] model={model_spec.name} repo={model_spec.repo} dataset={repo_id} "
-        f"steps={steps} global_batch={global_batch} per_process_batch={per_process_batch} "
-        f"lr={learning_rate} max_seq_len={max_seq_len} remat={os.environ.get('REMAT','decoder')} "
+        f"steps={steps} global_batch={global_batch} grad_accum={grad_accum} "
+        f"effective_batch={effective_batch} per_process_batch={per_process_batch} "
+        f"lr={learning_rate} warmup_ratio={warmup_ratio} low_mem_loss={low_mem_loss} "
+        f"max_seq_len={max_seq_len} remat={os.environ.get('REMAT','decoder')} "
         f"flash={use_flash} data_limit={data_limit} ckpt={checkpoint_dir} export={export_dir}",
         flush=True,
     )
@@ -160,10 +176,11 @@ def main() -> None:
       os.environ.get("RUN_NAME", f"{model_spec.name}-ot-agent-sft"),
       config={
           "stage": "sft", "model": model_spec.name, "dataset": repo_id,
-          "steps": steps, "global_batch": global_batch, "lr": learning_rate,
-          "warmup_ratio": warmup_ratio, "max_seq_len": max_seq_len,
-          "tp": tp, "fsdp": fsdp, "processes": process_count,
-          "remat": os.environ.get("REMAT", "decoder"),
+          "steps": steps, "global_batch": global_batch, "grad_accum": grad_accum,
+          "effective_batch": effective_batch, "lr": learning_rate,
+          "warmup_ratio": warmup_ratio, "low_mem_loss": low_mem_loss,
+          "max_seq_len": max_seq_len, "tp": tp, "fsdp": fsdp,
+          "processes": process_count, "remat": os.environ.get("REMAT", "decoder"),
       },
   )
 
@@ -174,6 +191,8 @@ def main() -> None:
       learning_rate=learning_rate,
       mesh=mesh,
       warmup_ratio=warmup_ratio,
+      grad_accum=grad_accum,
+      low_mem_loss=low_mem_loss,
       checkpoint_dir=checkpoint_dir,
       metrics_options=metrics,
   )

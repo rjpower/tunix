@@ -23,14 +23,32 @@ library** — the hard-won assets stay single-sourced — and adds only what
 | the `qwen3-32b` registry entry (added to `models/registry.py`) | `export_hf.py` — gather → single HF checkpoint → R2 |
 | | `submit_sft.sh` — `iris job run --replicas N` |
 
-## The model fits comfortably on 32× H100
+## Fitting Qwen3-32B on 32× H100 — what it actually took
 
-Qwen3-32B, fp32 params (the load-bearing invariant — a 1e-5 AdamW update is below
-bf16 ULP, so bf16 storage silently zeroes most updates): params 128 GB + AdamW
-m,v 256 GB + grads 128 GB ≈ **512 GB of optimizer state**, FSDP/TP-sharded over
-32 GPUs = **16 GB/GPU**, leaving ~64 GB/GPU for activations (decoder remat, bf16
-compute). Default mesh is `(fsdp=4, tp=8)`: TP=8 within a node (NVLink, and 8
-divides `num_kv_heads=8`), FSDP=4 across nodes (InfiniBand).
+**Resident state fits easily.** Qwen3-32B, fp32 params (the load-bearing
+invariant — a 1e-5 AdamW update is below bf16 ULP, so bf16 storage silently
+zeroes most updates): params 128 GB + AdamW m,v 256 GB + grads 128 GB ≈ **512 GB
+of optimizer state**, FSDP/TP-sharded over 32 GPUs = **16 GB/GPU**, leaving
+~64 GB/GPU for activations. Default mesh is `(fsdp=4, tp=8)`: TP=8 within a node
+(NVLink, and 8 divides `num_kv_heads=8`), FSDP=4 across nodes (InfiniBand).
+
+**The train step did *not* fit out of the box — two real findings:**
+
+1. **tunix's stock loss OOMs at 32B.** `_default_loss_fn` builds a
+   `jax.nn.one_hot(targets, V)` *and* a full `jax.nn.log_softmax(logits)` — two
+   `[B, S, V]` **fp32** tensors at `V=151936`. At batch-8/device × seq-4096 even
+   decoder remat couldn't pull the activation peak below ~72 GB/GPU (a single
+   63 GiB allocation), so 4×8 H100 OOM'd. `sft.low_mem_cross_entropy_loss` is a
+   mathematically identical drop-in (`logit[target] − logsumexp(logits)`, only
+   `[B, S]` reductions) installed via `PeftTrainer.with_loss_fn` — no tunix
+   change. It removes ~3 full `[B,S,V]` fp32 tensors; **value+gradient parity is
+   pinned in `test_low_mem_loss.py`.**
+2. **Per-device microbatch bounds the peak; grad-accum reaches the batch.** The
+   loss/activation peak scales with the *per-device* microbatch, not the
+   effective batch. So we run a small per-step batch (e.g. global 8 → 2/device on
+   fsdp=4) and use `gradient_accumulation_steps` (tunix-supported; `max_steps`
+   counts optimizer updates) to reach the paper's effective batch of 96. `data.py`
+   sizes the per-process row buffer by `steps × grad_accum` accordingly.
 
 ## The two things multi-node GPU actually required
 
@@ -122,11 +140,15 @@ card; we use 8192 (the precedent's fitted envelope). Override any via env, e.g.
 | process-disjoint data sharding | ✅ `test_data_sharding.py` |
 | HF export = loader inverse (real tunix Qwen3) | ✅ `test_export_roundtrip.py` |
 | SFT loop trains + moves weights (PeftTrainer, CPU) | ✅ `test_sft_loop.py` |
+| low-mem loss = stock loss (value+grad, real Qwen3) | ✅ `test_low_mem_loss.py` |
+| cosine+warmup LR schedule shape | ✅ `test_optimizer.py` |
 | `mega_eval` regression after registry edit | ✅ 46 passed |
 | single-node H100: load → SFT → gather → HF export → R2 | ✅ smoke passed (Qwen3-1.7B, loss 0.43, exit 0) |
 | multi-node (2-node) JAX world + disjoint data | ✅ both procs one world; `p0`/`p1` read disjoint shards |
-| 32B fit + multi-node 32B train on 4×8 H100 | ⏳ `STAGE=bigsmoke` |
-| full 100K replication (4 nodes) | ⏳ `STAGE=full` (recipe TBD from paper) |
+| 32B load + multi-node world on 4×8 H100 | ✅ `LOAD OK` ×4, one `(fsdp=4,tp=8)` world, disjoint data |
+| 32B train-step fit (stock loss) | ❌ OOM — 152k-vocab `[B,S,V]` fp32 loss tensors (→ low-mem loss + grad-accum) |
+| 32B train-step fit (low-mem loss + grad-accum) | ⏳ `STAGE=bigsmoke` re-run |
+| full 100K replication (4 nodes) | ⏳ `STAGE=full` (recipe wired from model card) |
 
 CPU checks:
 ```bash

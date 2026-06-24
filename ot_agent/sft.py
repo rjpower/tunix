@@ -23,12 +23,52 @@ from typing import Any
 
 import grain.python as grain
 import jax
+import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
 
 from tunix.sft.peft_trainer import PeftTrainer, TrainingConfig
 
 from mega_eval.training.common import clipped_adamw, sft_model_input_fn
+
+
+def low_mem_cross_entropy_loss(
+    model,
+    input_tokens: jax.Array,
+    input_mask: jax.Array,
+    positions: jax.Array,
+    attention_mask: jax.Array,
+    images: jax.Array | None = None,
+):
+  """Memory-lean drop-in for tunix's ``_default_loss_fn`` (identical math).
+
+  The default loss builds ``jax.nn.one_hot(targets, V)`` *and* a full
+  ``jax.nn.log_softmax(logits)`` -- two ``[B, S, V]`` fp32 tensors. At Qwen3's
+  ``V=151936`` and a long sequence those dominate HBM (the 32B train step's
+  ~60 GB activation peak / 63 GiB single allocation that OOM'd 4x8 H100).
+
+  ``log p(target) = logit[target] - logsumexp(logits)`` gives the same per-token
+  NLL using only ``[B, S]`` reductions: ``logsumexp`` reduces over ``V`` (XLA
+  fuses the transient) and ``take_along_axis`` gathers the target logit -- no
+  ``[B, S, V]`` one-hot, no materialized ``log_softmax``. Equivalent to
+  ``optax.softmax_cross_entropy(logits, one_hot).mean()`` over masked tokens;
+  ``test_low_mem_loss.py`` pins value+gradient parity against the default.
+  """
+  kwargs = {} if images is None else {"images": images}
+  logits, _ = model(input_tokens, positions, None, attention_mask, **kwargs)
+
+  logits = logits[:, :-1, :]
+  target_tokens = input_tokens[:, 1:]
+  target_mask = input_mask[:, 1:]
+
+  log_z = jax.nn.logsumexp(logits, axis=-1)  # [B, S-1]
+  target_logit = jnp.take_along_axis(
+      logits, target_tokens[..., None], axis=-1
+  )[..., 0]  # [B, S-1]
+  token_logp = target_logit - log_z  # = log_softmax(logits)[target]
+
+  norm_factor = 1.0 / (jnp.sum(target_mask) + 1e-8)
+  return -jnp.sum(token_logp * target_mask.astype(token_logp.dtype)) * norm_factor
 
 
 def build_optimizer(peak_lr: float, total_steps: int, warmup_ratio: float = 0.0):
@@ -65,6 +105,8 @@ def run_sharded_sft(
     learning_rate: float,
     mesh: jax.sharding.Mesh,
     warmup_ratio: float = 0.0,
+    grad_accum: int = 1,
+    low_mem_loss: bool = True,
     checkpoint_dir: str | None = None,
     save_interval_secs: int = 600,
     max_to_keep: int = 2,
@@ -79,6 +121,13 @@ def run_sharded_sft(
     steps: number of SFT optimizer steps.
     learning_rate: AdamW lr (clipped at global-norm 1.0).
     mesh: the device mesh the model is sharded on.
+    warmup_ratio: >0 enables cosine LR + linear warmup (paper recipe); 0 = const.
+    grad_accum: gradient-accumulation steps. ``steps`` counts OPTIMIZER updates;
+      tunix runs ``steps * grad_accum`` microbatches, so the effective (global)
+      batch = per-step global batch * grad_accum. Lets a small per-device
+      microbatch (which bounds the activation peak) reach a large effective batch.
+    low_mem_loss: use :func:`low_mem_cross_entropy_loss` (default) instead of
+      tunix's one-hot loss -- required to fit 32B's loss over the 152k vocab.
     checkpoint_dir: orbax checkpoint root (local or ``gs://``); ``None`` disables.
       NB: on the CW GPU cluster there is no shared filesystem across nodes, so a
       multi-node run should checkpoint to ``None`` here and rely on the post-run
@@ -107,14 +156,18 @@ def run_sharded_sft(
       training_config=TrainingConfig(
           eval_every_n_steps=10**9,
           max_steps=steps,
+          gradient_accumulation_steps=grad_accum if grad_accum > 1 else None,
           metrics_logging_options=metrics_options,
           checkpoint_root_directory=checkpoint_dir,
           checkpointing_options=checkpointing_options,
       ),
   )
   trainer.with_gen_model_input_fn(sft_model_input_fn)
+  if low_mem_loss:
+    trainer.with_loss_fn(low_mem_cross_entropy_loss, has_aux=False)
   print(
-      f"[ota-sft] steps={steps} lr={learning_rate} ckpt={checkpoint_dir} "
+      f"[ota-sft] steps={steps} lr={learning_rate} grad_accum={grad_accum} "
+      f"low_mem_loss={low_mem_loss} ckpt={checkpoint_dir} "
       f"process={jax.process_index()}/{jax.process_count()}",
       flush=True,
   )
