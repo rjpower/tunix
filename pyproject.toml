@@ -120,6 +120,11 @@ mega = [
 # for the throughput run once the cu12/cu13 cuDNN load order is sorted.
 levanter = [
   "marin-levanter",
+  # HF safetensors export (save_pretrained) writes via fsspec; s3fs lets it target
+  # s3:// (R2) for the durable checkpoint handed to the RL phase. The tokenized
+  # cache + Levanter training checkpoints use tensorstore's built-in s3 driver and
+  # do NOT need s3fs; only the HF export path does.
+  "s3fs",
 ]
 
 [project.urls]

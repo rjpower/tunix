@@ -1743,6 +1743,7 @@ gpu = [
 levanter = [
     { name = "marin-levanter", version = "0.2.20.dev202606180959", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.12' and extra == 'extra-12-google-tunix-gpu') or (python_full_version < '3.12' and extra == 'extra-12-google-tunix-levanter') or (python_full_version < '3.12' and extra != 'extra-12-google-tunix-prod') or (extra == 'extra-12-google-tunix-gpu' and extra == 'extra-12-google-tunix-prod') or (extra == 'extra-12-google-tunix-levanter' and extra == 'extra-12-google-tunix-prod')" },
     { name = "marin-levanter", version = "0.2.24.dev202606221125", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.12' and extra == 'extra-12-google-tunix-gpu') or (python_full_version >= '3.12' and extra == 'extra-12-google-tunix-levanter') or (python_full_version >= '3.12' and extra != 'extra-12-google-tunix-prod') or (extra == 'extra-12-google-tunix-gpu' and extra == 'extra-12-google-tunix-prod') or (extra == 'extra-12-google-tunix-levanter' and extra == 'extra-12-google-tunix-prod')" },
+    { name = "s3fs" },
 ]
 mega = [
     { name = "gcsfs" },
@@ -1818,6 +1819,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'test'" },
     { name = "python-dotenv" },
     { name = "qwix", specifier = ">=0.1.6" },
+    { name = "s3fs", marker = "extra == 'levanter'" },
     { name = "safetensors", specifier = "<0.8" },
     { name = "sentencepiece" },
     { name = "sphinx", marker = "extra == 'docs'", specifier = ">=8.2.3" },
