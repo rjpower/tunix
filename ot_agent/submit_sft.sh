@@ -83,8 +83,9 @@ case "${STAGE}" in
       -e GRAD_ACCUM "${GRAD_ACCUM:-2}" -e CE_CHUNKS "${CE_CHUNKS:-0}" \
       -e LR 1e-5 -e TP "${TP:-8}" -e MAX_SEQ_LEN "${MAX_SEQ_LEN:-32768}" \
       -e FLASH "${FLASH:-1}" -e REMAT "${REMAT:-decoder}" -e RUN_NAME "${NAME}" \
-      -e EXPORT_DIR "${EXPORT_BASE}/bigsmoke-32b-${TS}/hf" \
+      -e EXPORT_DIR "${EXPORT_DIR-${EXPORT_BASE}/bigsmoke-32b-${TS}/hf}" \
       -- python -m ot_agent.launch_sft
+    # ^ set EXPORT_DIR= (empty) to skip the export -- useful for perf-only runs.
     ;;
   full)
     # 4 nodes (32 H100): Qwen3-32B on the 100K set -- the FAITHFUL replication.
