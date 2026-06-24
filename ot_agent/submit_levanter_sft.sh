@@ -38,13 +38,13 @@ ENVS=(-e HF_TOKEN "${HF_TOKEN:-}" -e RUN_ID "${NAME}")
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   ENVS+=(-e WANDB_API_KEY "${WANDB_API_KEY}" -e WANDB_PROJECT "${WANDB_PROJECT:-ot-agent}")
 fi
-# R2 creds only matter when OTA_OUTPUT is s3://; harmless to forward otherwise.
-if [[ "${OTA_OUTPUT}" == s3://* && -n "${R2_ACCESS_KEY_ID:-}" ]]; then
+# R2 creds matter when EITHER the output OR the (shared) cache is on s3://.
+if [[ ( "${OTA_OUTPUT}" == s3://* || "${OTA_CACHE:-}" == s3://* ) && -n "${R2_ACCESS_KEY_ID:-}" ]]; then
   ENVS+=(-e AWS_ACCESS_KEY_ID "${R2_ACCESS_KEY_ID}" -e AWS_SECRET_ACCESS_KEY "${R2_SECRET_ACCESS_KEY}" \
          -e AWS_ENDPOINT_URL "${R2_ENDPOINT}")
 fi
 # Forward OTA_* knobs that are set in the environment.
-for v in OTA_MODEL OTA_DATASET OTA_SEQ OTA_BATCH OTA_PDP OTA_TP OTA_STEPS OTA_LR OTA_WARMUP OTA_HF_EXPORT OTA_OUTPUT OTA_RUN; do
+for v in OTA_MODEL OTA_DATASET OTA_SEQ OTA_BATCH OTA_PDP OTA_TP OTA_STEPS OTA_LR OTA_WARMUP OTA_HF_EXPORT OTA_OUTPUT OTA_CACHE OTA_RUN; do
   if [[ -n "${!v:-}" ]]; then ENVS+=(-e "$v" "${!v}"); fi
 done
 

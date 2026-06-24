@@ -36,6 +36,10 @@ Env knobs (all optional; defaults give the 8B smoke):
   OTA_WARMUP    warmup fraction         (default 0.1, the paper's)
   OTA_HF_EXPORT hf_save_steps           (default = OTA_STEPS, i.e. export once)
   OTA_OUTPUT    fsspec output root      (default s3://marin-na/users/power/ot-agent-levanter)
+  OTA_CACHE     tokenized-cache root    (default {OTA_OUTPUT}/cache; MUST be shared
+                                         storage -- the cache build fans out to
+                                         zephyr worker pods, so node-local /tmp
+                                         is invisible to the consolidating driver)
   OTA_RUN       run id suffix           (default from RUN_ID or "manual")
 """
 
@@ -135,7 +139,14 @@ def build_config() -> train_lm.TrainLmConfig:
     slug = dataset.split("/")[-1].lower()
     run_dir = f"{output}/{model_name}-{slug}-{run}"
     # Tokenized cache is keyed by dataset+tokenizer, not run -- reuse across runs.
-    cache_dir = f"{output}/cache/{slug}-qwen3"
+    # The cache MUST live on shared storage (S3/GCS): Levanter's cache build fans
+    # out to separate zephyr worker pods (each with its own /tmp), and the driver
+    # consolidates their shard outputs -- node-local paths aren't visible across
+    # pods. OTA_CACHE overrides the cache root independently of OTA_OUTPUT so the
+    # checkpoints/HF export can stay node-local (driver-only) while the cache is
+    # shared. tensorstore's built-in s3 driver reads/writes it (no s3fs needed).
+    cache_root = _env("OTA_CACHE", f"{output}/cache").rstrip("/")
+    cache_dir = f"{cache_root}/{slug}-qwen3"
 
     # Assistant-turn-only loss: the Qwen3 template's {% generation %} blocks tag
     # exactly the assistant/tool-call tokens; mask_user_turns drops the rest.
