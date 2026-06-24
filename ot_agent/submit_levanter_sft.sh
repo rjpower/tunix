@@ -63,8 +63,9 @@ for v in OTA_MODEL OTA_DATASET OTA_SEQ OTA_BATCH OTA_PDP OTA_TP OTA_STEPS OTA_LR
 done
 
 # Entrypoint: the one-time HF->Levanter checkpoint conversion (OTA_CONVERT=1, runs
-# on CPU so 1 node suffices) or the SFT trainer (default).
+# wholly on CPU so it can't OOM the GPUs -- 1 node suffices) or the SFT trainer.
 if [[ "${OTA_CONVERT:-0}" == "1" ]]; then
+  ENVS+=(-e JAX_PLATFORMS cpu)   # force the convert onto host RAM (no CUDA init)
   ENTRYPOINT=(python -m ot_agent.convert_hf_to_levanter)
 else
   ENTRYPOINT=(python -m ot_agent.levanter_sft)

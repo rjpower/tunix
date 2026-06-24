@@ -75,7 +75,22 @@ def build_config() -> export_hf_to_lm.ImportHfConfig:
 
 
 if __name__ == "__main__":
+    # Run wholly on CPU (host RAM, set via JAX_PLATFORMS=cpu in the submit script):
+    # the 64GB conversion never touches device memory, so this can't OOM the GPUs.
+    import numpy as np
+    from jax.sharding import Mesh
+    from haliax.partitioning import set_mesh
+
     cfg = build_config()
+    devices = jax.devices()
     logging.info("HF->Levanter convert: %s -> %s", cfg.hf_checkpoint, cfg.output_path)
-    logging.info("jax devices: %s", jax.devices())
-    export_hf_to_lm.main(cfg)
+    logging.info("jax devices: %s", devices)
+
+    # Levanter's safetensors loader shards each tensor via best_effort_sharding,
+    # which reads mesh.shape["data"] -- so it needs a mesh that actually HAS a
+    # "data" axis (otherwise KeyError 'data'). export_hf_to_lm doesn't set one up,
+    # so establish a trivial 1-device (replica, data, model) mesh here; data=1 makes
+    # best_effort_sharding a no-op (replicated on the single CPU device).
+    mesh = Mesh(np.asarray(devices[:1]).reshape(1, 1, 1), ("replica", "data", "model"))
+    with set_mesh(mesh):
+        export_hf_to_lm.main(cfg)
