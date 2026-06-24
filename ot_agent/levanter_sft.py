@@ -332,7 +332,43 @@ def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
     hfc.HFCheckpointConverter.load_pretrained = patched
 
 
+def _patch_adam_bf16_first_moment() -> None:
+    """Store Adam's first moment (mu) in bf16 to free ~2GB/device of optimizer state.
+
+    Qwen3-32B@32k on 32xH100 (TP=8, data=4) is memory-bound: the train step peaks
+    right at the BFC cap because the fused-CE backward materializes a ~3GB fp32
+    lm_head-gradient buffer on top of the persistent params+optimizer state (which
+    itself is the dominant, seq-independent consumer -- activations are small under
+    remat). The first attempt OOMd by exactly that ~2.9GB at `result.loss.item()`.
+
+    optax keeps Adam's mu (first moment) and nu (second moment) in fp32 by default
+    (8B/param total). mu tolerates bf16 well -- it's a running average of grads, and
+    bf16 momentum is standard in large-scale trainers -- so casting mu to bf16 halves
+    it (4GB->2GB/device) with negligible effect on this short SFT. nu stays fp32 (its
+    sqrt needs the precision) and the master weights stay fp32 (mp policy p=f32).
+
+    Levanter's AdamConfig.build calls ``optax.scale_by_adam(...)`` as a module
+    attribute (optim/config.py) without passing mu_dtype, so we wrap that attribute
+    to inject ``mu_dtype=bfloat16``. Saves enough headroom to keep full 32768 context
+    and a safe (~3GB) NCCL/context margin under XLA_PYTHON_CLIENT_MEM_FRACTION=0.96.
+    """
+    import jax.numpy as jnp
+    import optax
+
+    orig = optax.scale_by_adam
+    if getattr(orig, "_ota_bf16_mu", False):
+        return
+
+    def patched(*args, **kwargs):
+        kwargs.setdefault("mu_dtype", jnp.bfloat16)
+        return orig(*args, **kwargs)
+
+    patched._ota_bf16_mu = True
+    optax.scale_by_adam = patched
+
+
 if __name__ == "__main__":
+    _patch_adam_bf16_first_moment()
     _init_from = _env("OTA_INIT_FROM", "").rstrip("/")
     if _init_from:
         _patch_load_pretrained_from_checkpoint(_init_from)
