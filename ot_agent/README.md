@@ -126,11 +126,13 @@ see its docstring for the full knob table (`AGENT_MODEL`, `DATASET`, `SFT_STEPS`
 ### The full-run recipe (from the released `OpenThinkerAgent-32B-SFT-100K` card)
 
 The `STAGE=full` defaults reproduce the paper's recipe: **LR 4e-5**, **cosine
-schedule + warmup_ratio 0.1**, **global batch 96**, **5 epochs** (= `ceil(5 ×
-94,334 / 96)` = **4914 steps**), bf16 (the card's ZeRO-3 keeps an fp32 master —
-matching our fp32-params / bf16-compute setup). `MAX_SEQ_LEN` is not stated on the
-card; we use 8192 (the precedent's fitted envelope). Override any via env, e.g.
-`MAX_SEQ_LEN=16384 STAGE=full bash ot_agent/submit_sft.sh`.
+schedule + warmup_ratio 0.1**, **effective batch 96** (per-step 8 × grad-accum
+12), **5 epochs** (= `ceil(5 × 94,334 / 96)` = **4914 steps**), bf16 (the card's
+ZeRO-3 keeps an fp32 master — matching our fp32-params / bf16-compute setup). The
+card's **`cutoff_len: 32768`** is the one piece we cannot yet honor on GPU —
+`MAX_SEQ_LEN` defaults to 8192 only because tunix lacks a GPU flash kernel (see
+the blocker above); at the faithful 32768 the full run is multi-day and needs the
+cuDNN attention path first.
 
 ## Validation status
 
@@ -147,8 +149,31 @@ card; we use 8192 (the precedent's fitted envelope). Override any via env, e.g.
 | multi-node (2-node) JAX world + disjoint data | ✅ both procs one world; `p0`/`p1` read disjoint shards |
 | 32B load + multi-node world on 4×8 H100 | ✅ `LOAD OK` ×4, one `(fsdp=4,tp=8)` world, disjoint data |
 | 32B train-step fit (stock loss) | ❌ OOM — 152k-vocab `[B,S,V]` fp32 loss tensors (→ low-mem loss + grad-accum) |
-| 32B train-step fit (low-mem loss + grad-accum) | ⏳ `STAGE=bigsmoke` re-run |
-| full 100K replication (4 nodes) | ⏳ `STAGE=full` (recipe wired from model card) |
+| **32B train-step fit + full pipeline (low-mem loss + grad-accum)** | ✅ bigsmoke #2: seq 8192, 30 steps, no OOM, grad_norm↓, gather 707 tensors → 13-shard HF export → R2, exit 0 |
+| full 100K replication at the faithful **seq 32768** | ⛔ **blocked** — tunix has no GPU flash attention (see below) |
+
+## ⛔ Blocker for *faithful* replication: context length + GPU flash attention
+
+The released `OpenThinkerAgent-32B-SFT-100K` card trains at **`cutoff_len:
+32768`**, and the data demands it — measured token lengths on the 100K set
+(median **23,650**, p90 32,674):
+
+| cutoff | traces truncated | training **tokens retained** |
+|---|---|---|
+| 8192 | 98.8% | 35% |
+| 16384 | 77.6% | 66.6% |
+| 32768 | 9.2% | **98.9%** |
+
+So a faithful run needs ~32k context. But **tunix's Qwen3 flash attention is the
+TPU `splash` pallas kernel only** (`models/qwen3/model.py:27`); on **GPU it falls
+back to materialized `O(seq²)` attention**. At seq 32768 that's ~17 GB/layer even
+TP-sharded, and ~16× the seq-8192 attention FLOPs — a multi-day run on 32×H100,
+memory-fragile. **Resolution (proposed): wire `jax.nn.dot_product_attention(...,
+implementation='cudnn')` as the GPU branch** (cuDNN flash on H100, `O(seq)`
+memory), alongside the TPU splash path. Needed for all long-context GPU work
+here — the faithful SFT *and* the later RL pass. This is a core tunix-suitability
+finding: **tunix does 32B multi-node GPU SFT today, but lacks the GPU flash
+kernel needed for the long-context agentic regime.**
 
 CPU checks:
 ```bash
