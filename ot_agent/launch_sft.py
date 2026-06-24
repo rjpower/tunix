@@ -35,7 +35,9 @@ Config via env (all optional unless noted):
     must divide num_kv_heads=8 and the per-node device count).
   * ``DATA_LIMIT`` (unset = all rows) -- cap global rows scanned (smoke knob).
   * ``REMAT`` (decoder|block|none) -- activation rematerialization. ``FLASH``
-    (0|1, default 0 -- the splash kernel is TPU-only; leave off on GPU).
+    (0|1, default 0) -- flash attention. tunix now dispatches by platform: GPU
+    -> cuDNN flash (``jax.nn.dot_product_attention``), TPU -> splash. REQUIRED on
+    GPU for long context (>~8k): without it attention is materialized O(seq^2).
   * ``CKPT_DIR`` (unset) -- orbax checkpoint root. Leave UNSET on multi-node CW
     (no shared filesystem); use ``EXPORT_DIR`` instead. Useful for single-node /
     gs:// (TPU) resume.

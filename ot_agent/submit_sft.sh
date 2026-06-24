@@ -66,40 +66,40 @@ case "${STAGE}" in
       -- python -m ot_agent.launch_sft
     ;;
   bigsmoke)
-    # 4 nodes (32 H100): Qwen3-32B for ~30 steps -- the critical de-risk before
-    # the long run: does 32B (fp32 params + AdamW) FIT and train on 4x8 H100?
-    # Validates the FULL-run memory envelope: seq 8192, the gather-based low-mem
-    # loss (the stock one-hot loss OOM'd here -- 152k-vocab [B,S,V] fp32 tensors),
-    # and a small per-device microbatch (global 8 -> 2/device on fsdp=4) plus
-    # gradient accumulation (effective batch 32). Watch the XLA peak-HBM line to
-    # size the full run's per-step batch.
+    # 4 nodes (32 H100): Qwen3-32B for ~12 steps at the FAITHFUL seq 32768 with
+    # GPU cuDNN flash attention (FLASH=1) -- the de-risk for the long run: does
+    # the new GPU flash path work + fit at the paper's cutoff_len 32768? Without
+    # flash, seq-32768 attention is O(seq^2) and OOMs; with cuDNN flash it's
+    # O(seq). Small per-device microbatch (global 4 -> 1/device on fsdp=4) +
+    # grad-accum, low-mem loss on. Watch the XLA peak-HBM line to size the full
+    # run's per-step batch + estimate throughput at 32k.
     NAME="ota-sft-bigsmoke-32b-${TS}"
     "${IRIS[@]}" --gpu H100x8 --replicas 4 --cpu 32 --memory 512GB --disk 300GB --max-retries 0 \
       --job-name "${NAME}" "${ENVS[@]}" \
-      -e AGENT_MODEL qwen3-32b -e DATASET 10k -e DATA_LIMIT 8192 \
-      -e SFT_STEPS 30 -e BATCH_SIZE 8 -e GRAD_ACCUM 4 -e LR 1e-5 -e TP 8 \
-      -e MAX_SEQ_LEN 8192 -e REMAT decoder -e RUN_NAME "${NAME}" \
+      -e AGENT_MODEL qwen3-32b -e DATASET 10k -e DATA_LIMIT 512 \
+      -e SFT_STEPS 12 -e BATCH_SIZE 4 -e GRAD_ACCUM 2 -e LR 1e-5 -e TP 8 \
+      -e MAX_SEQ_LEN 32768 -e FLASH 1 -e REMAT decoder -e RUN_NAME "${NAME}" \
       -e EXPORT_DIR "${EXPORT_BASE}/bigsmoke-32b-${TS}/hf" \
       -- python -m ot_agent.launch_sft
     ;;
   full)
-    # 4 nodes (32 H100): Qwen3-32B on the 100K set -- the replication run.
+    # 4 nodes (32 H100): Qwen3-32B on the 100K set -- the FAITHFUL replication.
     # Recipe from the released OpenThinkerAgent-32B-SFT-100K model card:
-    #   lr 4e-5, cosine + warmup_ratio 0.1, EFFECTIVE batch 96, 5 epochs, bf16.
-    # 5 epochs of 94,334 rows @ effective batch 96 = ceil(5*94334/96) = 4914
-    # optimizer steps. The effective batch is reached as per-step BATCH_SIZE 8
-    # (2/device on fsdp=4) x GRAD_ACCUM 12 = 96 -- the small per-device microbatch
-    # bounds the activation peak so the 32B loss over the 152k vocab fits (see
-    # bigsmoke). Raise BATCH_SIZE / lower GRAD_ACCUM if bigsmoke shows HBM
-    # headroom (faster: fewer accumulation microbatches). low-mem loss is on.
+    #   lr 4e-5, cosine + warmup_ratio 0.1, EFFECTIVE batch 96, 5 epochs, bf16,
+    #   cutoff_len 32768. 5 epochs of 94,334 rows @ eff batch 96 = 4914 steps.
+    # Effective batch = per-step BATCH_SIZE 4 (1/device on fsdp=4) x GRAD_ACCUM 24.
+    # GPU cuDNN flash (FLASH=1) makes the 32k context fit (O(seq) attention).
+    # WARNING: the full 5-epoch/100K @ 32k run is MULTI-WEEK on 32 H100 (~118k
+    # microbatches at seq 32768). For a scoped demonstration, override e.g.
+    #   SFT_STEPS=<fewer>  or  DATASET=10k  or  a shorter MAX_SEQ_LEN.
     NAME="ota-sft-qwen3-32b-100k-${TS}"
     "${IRIS[@]}" --gpu H100x8 --replicas 4 --cpu 32 --memory 512GB --disk 300GB --max-retries 1 \
       --job-name "${NAME}" "${ENVS[@]}" \
-      -e AGENT_MODEL qwen3-32b -e DATASET 100k \
-      -e SFT_STEPS "${SFT_STEPS:-4914}" -e BATCH_SIZE "${BATCH_SIZE:-8}" \
-      -e GRAD_ACCUM "${GRAD_ACCUM:-12}" \
+      -e AGENT_MODEL qwen3-32b -e DATASET "${DATASET:-100k}" \
+      -e SFT_STEPS "${SFT_STEPS:-4914}" -e BATCH_SIZE "${BATCH_SIZE:-4}" \
+      -e GRAD_ACCUM "${GRAD_ACCUM:-24}" \
       -e LR "${LR:-4e-5}" -e WARMUP_RATIO "${WARMUP_RATIO:-0.1}" \
-      -e TP "${TP:-8}" -e MAX_SEQ_LEN "${MAX_SEQ_LEN:-8192}" \
+      -e TP "${TP:-8}" -e MAX_SEQ_LEN "${MAX_SEQ_LEN:-32768}" -e FLASH "${FLASH:-1}" \
       -e REMAT "${REMAT:-decoder}" -e RUN_NAME "${NAME}" \
       -e EXPORT_DIR "${EXPORT_BASE}/qwen3-32b-100k-${TS}/hf" \
       -- python -m ot_agent.launch_sft
