@@ -293,6 +293,7 @@ def export_and_mirror(model, model_dir: str, export_dir: str, *, mesh=None,
     if os.path.exists(local_dir):
       shutil.rmtree(local_dir)
     _write_sharded_safetensors(state, local_dir)
+    del state  # free ~64 GB before the concurrent R2 upload buffers
     _copy_aux_files(model_dir, local_dir)
     if is_remote:
       _mirror_to_s3(local_dir, export_dir)
