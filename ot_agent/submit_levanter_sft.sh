@@ -54,6 +54,13 @@ ENVS+=(-e XLA_PYTHON_CLIENT_MEM_FRACTION "${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.93
 # removes that probing spike; the default kernels still fit and run within the
 # established envelope. Override XLA_FLAGS to re-tune (e.g. add other flags).
 ENVS+=(-e XLA_FLAGS "${XLA_FLAGS:---xla_gpu_autotune_level=0}")
+# The fused-CE Pallas kernel ALSO autotunes, SEPARATELY from XLA: on a cache miss it
+# sweeps 7 block-size candidates, and the largest probe allocates ~2.9GB on top of
+# the already-tight 32B@32k step -> RESOURCE_EXHAUSTED at result.loss.item() (the
+# kernel that actually runs is fine; it's the SWEEP that OOMs). Disable the on-miss
+# sweep so the kernel uses inferred default block sizes (no probing spike). To get the
+# tuned kernel later, run once with this =1 on a roomier config and persist the cache.
+ENVS+=(-e LEVANTER_PALLAS_CE_AUTOTUNE_ON_MISS "${LEVANTER_PALLAS_CE_AUTOTUNE_ON_MISS:-0}")
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   ENVS+=(-e WANDB_API_KEY "${WANDB_API_KEY}" -e WANDB_PROJECT "${WANDB_PROJECT:-ot-agent}")
 fi
