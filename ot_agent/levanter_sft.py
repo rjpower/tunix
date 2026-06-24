@@ -35,6 +35,7 @@ Env knobs (all optional; defaults give the 8B smoke):
   OTA_LR        peak LR                 (default 4e-5, the paper's)
   OTA_WARMUP    warmup fraction         (default 0.1, the paper's)
   OTA_HF_EXPORT hf_save_steps           (default = OTA_STEPS, i.e. export once)
+  OTA_CKPT_MINUTES train-state ckpt cadence in minutes (default 120)
   OTA_OUTPUT    fsspec output root      (default s3://marin-na/users/power/ot-agent-levanter)
   OTA_CACHE     tokenized-cache root    (default {OTA_OUTPUT}/cache; MUST be shared
                                          storage -- the cache build fans out to
@@ -43,6 +44,7 @@ Env knobs (all optional; defaults give the 8B smoke):
   OTA_RUN       run id suffix           (default from RUN_ID or "manual")
 """
 
+import datetime
 import os
 
 import jmp
@@ -126,6 +128,9 @@ def build_config() -> train_lm.TrainLmConfig:
     lr = float(_env("OTA_LR", str(PAPER_LR)))
     warmup = float(_env("OTA_WARMUP", str(PAPER_WARMUP)))
     hf_export = int(_env("OTA_HF_EXPORT", str(steps)))
+    # Checkpoint cadence (minutes). A 32B train state is hundreds of GB; the
+    # Levanter default (15 min) would saturate R2 over a 12h run, so default to 2h.
+    ckpt_minutes = int(_env("OTA_CKPT_MINUTES", "120"))
     output = _env("OTA_OUTPUT", "s3://marin-na/users/power/ot-agent-levanter").rstrip("/")
     run = _env("OTA_RUN", os.environ.get("RUN_ID", "manual"))
 
@@ -184,7 +189,10 @@ def build_config() -> train_lm.TrainLmConfig:
         per_device_parallelism=pdp,
         num_train_steps=steps,
         steps_per_eval=10**9,  # smoke: no periodic validation
-        checkpointer=CheckpointerConfig(base_path=f"{run_dir}/checkpoints"),
+        checkpointer=CheckpointerConfig(
+            base_path=f"{run_dir}/checkpoints",
+            save_interval=datetime.timedelta(minutes=ckpt_minutes),
+        ),
         # FSDP shards params+optimizer over the cross-device ``data`` axis;
         # ``model`` is intra-node tensor parallel (1 = pure FSDP).
         mesh=MeshConfig(axes={"replica": 1, "data": -1, "model": tp}),

@@ -44,7 +44,7 @@ if [[ ( "${OTA_OUTPUT}" == s3://* || "${OTA_CACHE:-}" == s3://* ) && -n "${R2_AC
          -e AWS_ENDPOINT_URL "${R2_ENDPOINT}")
 fi
 # Forward OTA_* knobs that are set in the environment.
-for v in OTA_MODEL OTA_DATASET OTA_SEQ OTA_BATCH OTA_PDP OTA_TP OTA_STEPS OTA_LR OTA_WARMUP OTA_HF_EXPORT OTA_OUTPUT OTA_CACHE OTA_RUN; do
+for v in OTA_MODEL OTA_DATASET OTA_SEQ OTA_BATCH OTA_PDP OTA_TP OTA_STEPS OTA_LR OTA_WARMUP OTA_HF_EXPORT OTA_CKPT_MINUTES OTA_OUTPUT OTA_CACHE OTA_RUN; do
   if [[ -n "${!v:-}" ]]; then ENVS+=(-e "$v" "${!v}"); fi
 done
 
