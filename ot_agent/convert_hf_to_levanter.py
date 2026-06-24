@@ -161,6 +161,15 @@ def convert(cfg: export_hf_to_lm.ImportHfConfig) -> None:
             step=0,
             is_temporary=False,
         )
+        # save_checkpoint kicks the GlobalAsyncCheckpointManager commit off
+        # asynchronously and returns immediately. Levanter only auto-waits when IT
+        # created the manager (tree_serialize_leaves_tensorstore: `if manager_was_none`),
+        # so when we pass our OWN manager we MUST block here -- otherwise convert()
+        # returns and the interpreter tears the in-flight writer thread down
+        # mid-commit -> SIGSEGV (exit 139) and a truncated checkpoint with no
+        # metadata.json (the commit_callback that writes it never fires).
+        manager.wait_until_finished()
+        manager.check_for_errors()
     logger.info("Conversion completed successfully!")
 
 
