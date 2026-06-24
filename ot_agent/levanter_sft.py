@@ -45,6 +45,7 @@ Env knobs (all optional; defaults give the 8B smoke):
 """
 
 import datetime
+import logging
 import os
 
 import jmp
@@ -71,6 +72,8 @@ from ot_agent._qwen3_chat_template import QWEN_3_CHAT_TEMPLATE
 # warmup_ratio 0.1, effective batch 96, 5 epochs, bf16, cutoff_len 32768.
 PAPER_LR = 4e-5
 PAPER_WARMUP = 0.1
+
+logger = logging.getLogger(__name__)
 
 
 def _qwen3_8b(seq_len: int) -> Qwen3Config:
@@ -226,6 +229,12 @@ def build_config() -> train_lm.TrainLmConfig:
         model=model,
         optimizer=optimizer,
         train_seq_len=seq_len,
+        # Always go through Levanter's initialize_from_hf flow. For 8B it loads HF
+        # directly; for the 32B warm-start (OTA_INIT_FROM) we keep this set so the
+        # same code path runs, but _patch_load_pretrained_from_checkpoint replaces
+        # the HF conversion with a gentle tensorstore load of the pre-converted
+        # checkpoint (see __main__). use_hf_model_config stays False (its default)
+        # so train_lm passes our explicit Qwen3Config to load_pretrained.
         initialize_from_hf=base_ckpt,
         # NB: pad_tokenizer_to_match_model is intentionally False; see
         # _patch_levanter_vocab_resize for the Qwen padded-vocab story.
@@ -271,6 +280,59 @@ def _patch_levanter_vocab_resize() -> None:
     hfc.HFCheckpointConverter.load_pretrained = patched
 
 
+def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
+    """Warm-start 32B from a pre-converted Levanter checkpoint, gently.
+
+    The one-shot HF->2D-sharded weight load OOMs at 32B: Levanter converts the whole
+    safetensors state dict to the 2D (data x model) layout inside a single named_jit
+    (all layers + the GQA q/k/v reshapes at once), and that ~52GB reshard transient
+    stacked on the ~22GB optimizer state (already built by ``trainer.initial_state``)
+    exceeds 80GB. ``ot_agent/convert_hf_to_levanter.py`` does the HF conversion once
+    on the CPU (host RAM) and writes a Tensorstore checkpoint; here we replace
+    ``HFCheckpointConverter.load_pretrained`` so the in-training "load" just builds
+    the model template and deserializes that checkpoint **per array** straight into
+    the 2D layout (``load_checkpoint`` with ``axis_mapping``) -- no monolithic
+    conversion jit, peak ~= opt(22GB) + model(2GB). This mirrors train_lm's own
+    ``initialize_from_checkpoint_path`` recipe (build -> load_checkpoint -> shard),
+    minus ``subpath="model"`` because export_hf_to_lm saves the bare model tree.
+
+    The converted checkpoint already has the vocab resized to the tokenizer's 151669
+    (export_hf_to_lm resize_vocab_to_match_tokenizer=True), so no resize is needed
+    here and this patch is used *instead of* _patch_levanter_vocab_resize.
+    """
+    import haliax
+    import jax
+    import equinox as eqx
+    import levanter.compat.hf_checkpoints as hfc
+    from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
+
+    orig = hfc.HFCheckpointConverter.load_pretrained
+    if getattr(orig, "_ota_ckpt_patched", False):
+        return
+
+    def patched(self, lm_model_cls, ref=None, config=None, axis_mapping=None,
+                resize_vocab_to_match_tokenizer=False, dtype=None):
+        # train_lm passes config=config.model (use_hf_model_config defaults False);
+        # fall back to the HF arch if it ever passes None.
+        if config is None:
+            config = self.config_from_hf_config(self.hf_config_from_hf_checkpoint(ref))
+        Vocab = self.Vocab  # tokenizer vocab (151669) == the converted checkpoint's
+        path = latest_checkpoint_path(ckpt_path) or ckpt_path
+        logger.info("OTA warm-start: loading Levanter checkpoint %s into the 2D layout", path)
+        template = config.build(Vocab, key=jax.random.PRNGKey(0))
+        model = load_checkpoint(template, path, axis_mapping=axis_mapping)
+        if axis_mapping is not None:
+            model = haliax.shard(model, axis_mapping)
+        return model
+
+    patched._ota_ckpt_patched = True
+    hfc.HFCheckpointConverter.load_pretrained = patched
+
+
 if __name__ == "__main__":
-    _patch_levanter_vocab_resize()
+    _init_from = _env("OTA_INIT_FROM", "").rstrip("/")
+    if _init_from:
+        _patch_load_pretrained_from_checkpoint(_init_from)
+    else:
+        _patch_levanter_vocab_resize()
     train_lm.main(build_config())

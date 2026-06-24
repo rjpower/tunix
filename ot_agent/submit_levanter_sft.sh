@@ -32,7 +32,9 @@ R2_ENDPOINT="${R2_ENDPOINT:-https://74981a43be0de7712369306c7b19133d.r2.cloudfla
 # Smoke default: node-local output (ephemeral) so no S3/tensorstore-s3/s3fs deps.
 export OTA_OUTPUT="${OTA_OUTPUT:-/tmp/ota-levanter}"
 TS="$(date +%s)"
-NAME="ota-levanter-${OTA_MODEL:-8b}-${TS}"
+_TAG="${OTA_MODEL:-8b}"
+if [[ "${OTA_CONVERT:-0}" == "1" ]]; then _TAG="convert-${_TAG}"; fi
+NAME="ota-levanter-${_TAG}-${TS}"
 
 ENVS=(-e HF_TOKEN "${HF_TOKEN:-}" -e RUN_ID "${NAME}")
 # 32B@32k: the train step needs ~61GB/GPU (< 80GB physical), but the HF-load +
@@ -47,15 +49,26 @@ ENVS+=(-e XLA_PYTHON_CLIENT_MEM_FRACTION "${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.93
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   ENVS+=(-e WANDB_API_KEY "${WANDB_API_KEY}" -e WANDB_PROJECT "${WANDB_PROJECT:-ot-agent}")
 fi
-# R2 creds matter when EITHER the output OR the (shared) cache is on s3://.
-if [[ ( "${OTA_OUTPUT}" == s3://* || "${OTA_CACHE:-}" == s3://* ) && -n "${R2_ACCESS_KEY_ID:-}" ]]; then
+# R2 creds matter when ANY of the output / cache / convert-target / warm-start
+# source is on s3:// (all use tensorstore's built-in s3 driver, no s3fs).
+if [[ ( "${OTA_OUTPUT}" == s3://* || "${OTA_CACHE:-}" == s3://* \
+        || "${OTA_CONVERT_OUTPUT:-}" == s3://* || "${OTA_INIT_FROM:-}" == s3://* ) \
+      && -n "${R2_ACCESS_KEY_ID:-}" ]]; then
   ENVS+=(-e AWS_ACCESS_KEY_ID "${R2_ACCESS_KEY_ID}" -e AWS_SECRET_ACCESS_KEY "${R2_SECRET_ACCESS_KEY}" \
          -e AWS_ENDPOINT_URL "${R2_ENDPOINT}")
 fi
 # Forward OTA_* knobs that are set in the environment.
-for v in OTA_MODEL OTA_DATASET OTA_SEQ OTA_BATCH OTA_PDP OTA_TP OTA_STEPS OTA_LR OTA_WARMUP OTA_HF_EXPORT OTA_CKPT_MINUTES OTA_OUTPUT OTA_CACHE OTA_RUN; do
+for v in OTA_MODEL OTA_DATASET OTA_SEQ OTA_BATCH OTA_PDP OTA_TP OTA_STEPS OTA_LR OTA_WARMUP OTA_HF_EXPORT OTA_CKPT_MINUTES OTA_OUTPUT OTA_CACHE OTA_RUN OTA_INIT_FROM OTA_CONVERT_OUTPUT; do
   if [[ -n "${!v:-}" ]]; then ENVS+=(-e "$v" "${!v}"); fi
 done
+
+# Entrypoint: the one-time HF->Levanter checkpoint conversion (OTA_CONVERT=1, runs
+# on CPU so 1 node suffices) or the SFT trainer (default).
+if [[ "${OTA_CONVERT:-0}" == "1" ]]; then
+  ENTRYPOINT=(python -m ot_agent.convert_hf_to_levanter)
+else
+  ENTRYPOINT=(python -m ot_agent.levanter_sft)
+fi
 
 REPLICA_ARGS=()
 if [[ "${REPLICAS}" -gt 1 ]]; then REPLICA_ARGS=(--replicas "${REPLICAS}"); fi
@@ -66,7 +79,7 @@ uv run iris --cluster="${CLUSTER}" job run --no-wait \
   --enable-extra-resources --extra gpu --extra levanter \
   --gpu "${GPUS}" "${REPLICA_ARGS[@]}" --cpu 32 --memory 256GB --disk 512GB --max-retries 0 \
   --job-name "${NAME}" "${ENVS[@]}" \
-  -- python -m ot_agent.levanter_sft
+  -- "${ENTRYPOINT[@]}"
 
 echo "submitted ${NAME}"
 echo "watch: uv run iris --cluster=${CLUSTER} job logs /power/${NAME} --follow"
