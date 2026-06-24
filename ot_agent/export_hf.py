@@ -92,6 +92,34 @@ def _dotted(path) -> str:
   return key
 
 
+def _silence_jax_monitoring() -> None:
+  """Drop dangling jax.monitoring listeners before the post-training gather.
+
+  tunix's ``MetricsLogger`` registers wandb's ``log_scalar`` as a global
+  ``jax.monitoring`` scalar listener but on close only clears *event* listeners
+  (not the scalar one), so after ``wandb.finish()`` the listener dangles. Any
+  JAX *compile* after training (e.g. the multi-host ``process_allgather`` in the
+  export) emits a ``jax/core/compile/...`` scalar -> the listener forwards it to
+  the finished wandb run -> ``wandb.Error: must call wandb.init() before log()``.
+  Single-process export dodged this (``device_get`` never compiles). Clear the
+  scalar listeners (best-effort) so the export's compiles are silent.
+  """
+  # ``get_scalar_listeners`` lives only in the private module (the public
+  # ``jax.monitoring`` exposes register/unregister but not the getter), so reach
+  # into ``jax._src.monitoring`` and clear its listener list directly.
+  try:
+    from jax._src import monitoring as jm  # noqa: PLC0415
+    for listener in list(jm.get_scalar_listeners()):
+      jm.unregister_scalar_listener(listener)
+  except Exception as e:  # pylint: disable=broad-except
+    try:
+      from jax._src import monitoring as jm  # noqa: PLC0415
+      jm._scalar_listeners.clear()  # pylint: disable=protected-access
+    except Exception:  # pylint: disable=broad-except
+      print(f"[ota-export] could not clear jax monitoring listeners ({e!r}); "
+            "continuing.", flush=True)
+
+
 def _gather_host(x: jax.Array) -> np.ndarray:
   """Gathers a (possibly multi-host sharded) array to a replicated host numpy."""
   if jax.process_count() > 1:
@@ -247,6 +275,10 @@ def export_and_mirror(model, model_dir: str, export_dir: str, *, mesh=None,
   """
   is_remote = export_dir.startswith("s3://")
   local_dir = local_staging if is_remote else export_dir
+
+  # The gather below compiles; clear any dangling wandb monitoring listener so a
+  # post-training compile does not forward into a finished wandb run (see fn doc).
+  _silence_jax_monitoring()
 
   ctx = mesh if mesh is not None else _nullcontext()
   with ctx:
