@@ -195,7 +195,19 @@ def build_config() -> train_lm.TrainLmConfig:
         ),
         # FSDP shards params+optimizer over the cross-device ``data`` axis;
         # ``model`` is intra-node tensor parallel (1 = pure FSDP).
-        mesh=MeshConfig(axes={"replica": 1, "data": -1, "model": tp}),
+        #
+        # Qwen3 attention q/k/v projections carry the GQA ``kv_head`` axis, which
+        # Levanter's default shared_mapping ({mlp,heads}->model) does NOT cover --
+        # so at TP>1 they'd shard only over ``data``, leaving attention params/opt
+        # under-sharded (the 32B init OOM). Map kv_head->model so q/k/v shard over
+        # the TP axis (kv_head=8 == model=8 for Qwen3-32B); o_proj/MLP already shard
+        # via heads/mlp->model. Also map it in compute so the attention activations
+        # shard (else they replicate -> the 50GB activation OOM). No-op at TP=1.
+        mesh=MeshConfig(
+            axes={"replica": 1, "data": -1, "model": tp},
+            param_mapping={"embed": "data", "kv_head": "model"},
+            compute_mapping={"kv_head": "model"},
+        ),
         allow_nondivisible_batch_size=True,
     )
 
