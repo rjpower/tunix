@@ -13,7 +13,7 @@ SFT launcher needs, so we keep a copy here rather than depend on the whole
 ``experiments`` package.
 """
 
-QWEN_3_CHAT_TEMPLATE = r"""{%- if tools %}
+QWEN_3_CHAT_TEMPLATE = r"""{%- if tools is defined and tools %}
     {{- '<|im_start|>system\n' }}
     {%- if messages[0].role == 'system' %}
         {{- messages[0].content + '\n\n' }}
@@ -64,12 +64,12 @@ QWEN_3_CHAT_TEMPLATE = r"""{%- if tools %}
         {%- else %}
             {{- '<|im_start|>' + message.role + '\n' }}{% generation %}{{- content }}{% endgeneration %}
         {%- endif %}
-        {%- if message.tool_calls %}
+        {%- if message.tool_calls is defined and message.tool_calls %}
             {%- for tool_call in message.tool_calls %}
                 {%- if (loop.first and content) or (not loop.first) %}
                     {% generation %}{{- '\n' }}{% endgeneration %}
                 {%- endif %}
-                {%- if tool_call.function %}
+                {%- if tool_call.function is defined and tool_call.function %}
                     {%- set tool_call = tool_call.function %}
                 {%- endif %}
                 {% generation %}{{- '<tool_call>\n{"name": "' }}
