@@ -49,13 +49,13 @@ done
 REPLICA_ARGS=()
 if [[ "${REPLICAS}" -gt 1 ]]; then REPLICA_ARGS=(--replicas "${REPLICAS}"); fi
 
-set -x
+# NB: do not `set -x` here -- ENVS carries secrets (HF_TOKEN, WANDB/R2 keys).
+echo "submitting ${NAME}: model=${OTA_MODEL:-8b} dataset=${OTA_DATASET:-OT-Agent-1K} seq=${OTA_SEQ:-32768} steps=${OTA_STEPS:-40} output=${OTA_OUTPUT}"
 uv run iris --cluster="${CLUSTER}" job run --no-wait \
   --enable-extra-resources --extra gpu --extra levanter \
   --gpu "${GPUS}" "${REPLICA_ARGS[@]}" --cpu 32 --memory 256GB --disk 512GB --max-retries 0 \
   --job-name "${NAME}" "${ENVS[@]}" \
   -- python -m ot_agent.levanter_sft
-set +x
 
 echo "submitted ${NAME}"
 echo "watch: uv run iris --cluster=${CLUSTER} job logs /power/${NAME} --follow"
