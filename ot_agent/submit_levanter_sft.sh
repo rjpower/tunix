@@ -5,13 +5,15 @@
 # Submit the OpenThoughts-Agent Qwen3 SFT (Levanter) to the CoreWeave H100
 # cluster. Unlike the tunix path (ot_agent/submit_sft.sh), this runs Levanter
 # directly: one job does HF init -> tokenize/cache -> train -> HF export, using
-# Levanter's fused-CE GPU kernel + NVTE flash + packing. The job image is built
-# from THIS repo with the `gpu`+`levanter` extras (marin-levanter[gpu]); the
+# Levanter's fused CE (no [B,S,V] logits) + O(seq) blockwise FlashAttention +
+# packing. The job image is built from THIS repo with the `gpu`+`levanter` extras
+# (marin-levanter, jax[cuda13] from `gpu`; NOT marin-levanter[gpu] -- its
+# torch-pulling kernel deps clash with jax's cuDNN, see pyproject `levanter`); the
 # launcher is `python -m ot_agent.levanter_sft`, configured by OTA_* env vars.
 #
 # Default = the 8B de-risk smoke: 1 node (8xH100), OT-Agent-1K, seq 32768, ~40
 # steps, output to node-local disk (no S3 needed). It validates every mechanism
-# (HF load, packing + assistant mask, NVTE flash, fused CE at 32k, HF export)
+# (HF load, packing + assistant mask, O(seq) flash, fused CE at 32k, HF export)
 # before committing the 32B run.
 #
 # Usage:

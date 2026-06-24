@@ -106,13 +106,20 @@ mega = [
 ]
 # Levanter SFT track: drive Levanter directly (ot_agent/levanter_sft.py ->
 # levanter.main.train_lm) for the OpenThoughts-Agent Qwen3 SFT, where Levanter's
-# fused-CE GPU kernel + NVTE flash + sequence packing fit Qwen3 at seq 32768
-# where our hand-rolled tunix path did not. marin-levanter[gpu] is a published
-# PyPI nightly that pins jax[cuda13]==0.10.0 (same as our `gpu` extra) and pulls
-# nvidia-nccl-cu13 + jax-triton + the Triton CE kernel. Launch GPU SFT jobs with
-# `--extra gpu --extra levanter`. Mutually exclusive with `prod` (jax[tpu]).
+# fused CE (no [B,S,V] logit materialization) + O(seq) flash + sequence packing
+# fit Qwen3 at seq 32768 where our hand-rolled tunix path did not. Launch GPU SFT
+# jobs with `--extra gpu --extra levanter` (our `gpu` extra supplies
+# jax[cuda13]==0.10.0 + cu13 cuDNN 9.23). Mutually exclusive with `prod` (jax[tpu]).
+#
+# NB: deliberately NOT marin-levanter[gpu] -- that extra's GPU-kernel deps
+# (flash-attn-4, quack-kernels, torch-c-dlpack-ext) drag in torch, whose bundled
+# nvidia-cudnn-cu12 (9.10.2) shadows jax's cu13 cuDNN (9.23) at runtime and
+# crashes jaxlib's dnn init (RET_CHECK dnn_support, needs >=9.12). Without [gpu]
+# Levanter falls back to pure-jax blockwise FlashAttention (O(seq)) + XLA fused CE
+# -- correct and OOM-free at 32k, just not the Triton/FA4 kernels. Re-add [gpu]
+# for the throughput run once the cu12/cu13 cuDNN load order is sorted.
 levanter = [
-  "marin-levanter[gpu]",
+  "marin-levanter",
 ]
 
 [project.urls]
