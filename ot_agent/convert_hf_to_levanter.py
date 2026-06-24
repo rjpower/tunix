@@ -56,6 +56,8 @@ from jax.experimental.array_serialization.serialization import GlobalAsyncCheckp
 
 from haliax.partitioning import set_mesh
 
+import fsspec
+
 from levanter.checkpoint import save_checkpoint
 from levanter.compat.hf_checkpoints import RepoRef, load_tokenizer
 from levanter.main import export_hf_to_lm
@@ -120,6 +122,25 @@ def _build_fsdp_mesh():
     return mesh, mesh_cfg.resolved_param_mapping
 
 
+def _clean_stale_output(path: str) -> None:
+    """Remove any existing checkpoint dir so tensorstore writes fresh arrays.
+
+    tensorstore opens each array with create=true,open=true: if a prior (possibly
+    partial or differently-sharded) convert left arrays under this prefix, the new
+    write's chunk layout won't match the stale array's metadata and tensorstore
+    raises FAILED_PRECONDITION (e.g. q_proj chunk [64,8,8,128,640] for a data=8
+    convert vs a leftover [16,8,8,128,5120] from a data=4 run). Clearing the prefix
+    makes the convert idempotent regardless of what a previous attempt left behind.
+    """
+    fs, _, (plain,) = fsspec.get_fs_token_paths(path)
+    try:
+        if fs.exists(plain):
+            logger.info("Removing stale checkpoint dir before convert: %s", path)
+            fs.rm(plain, recursive=True)
+    except FileNotFoundError:
+        pass
+
+
 def convert(cfg: export_hf_to_lm.ImportHfConfig) -> None:
     start = time.time()
     hf_ref = cfg.hf_checkpoint if isinstance(cfg.hf_checkpoint, RepoRef) else RepoRef.from_string(cfg.hf_checkpoint)
@@ -146,6 +167,7 @@ def convert(cfg: export_hf_to_lm.ImportHfConfig) -> None:
             dtype=dtype,
         )
 
+        _clean_stale_output(cfg.output_path)
         mkdirs(cfg.output_path)
         logger.info("Saving Levanter checkpoint (step=0) to %s", cfg.output_path)
         manager = GlobalAsyncCheckpointManager()
