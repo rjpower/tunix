@@ -9,10 +9,12 @@
 # JAX world via ot_agent.distributed.init_distributed). The entrypoint is
 # `python -m ot_agent.launch_sft`, configured entirely by `-e` env vars.
 #
-# Three rungs of a smoke ladder (run them in order before the full run):
+# Four rungs of a smoke ladder (run them in order before the full run):
 #   STAGE=single   1 node (8 H100), Qwen3-1.7B  -- validates the SFT loop + export
 #   STAGE=multi    2 nodes,         Qwen3-1.7B  -- validates the multi-node JAX
 #                                                  world + process-disjoint data
+#   STAGE=bigsmoke 4 nodes (32 H100), Qwen3-32B, ~30 steps -- de-risks the 32B
+#                                                  memory FIT on 4x8 H100 + export
 #   STAGE=full     4 nodes (32 H100), Qwen3-32B -- the 100K replication run
 #
 # Usage:
@@ -63,6 +65,19 @@ case "${STAGE}" in
       -e EXPORT_DIR "${EXPORT_BASE}/smoke-multi-${TS}/hf" \
       -- python -m ot_agent.launch_sft
     ;;
+  bigsmoke)
+    # 4 nodes (32 H100): Qwen3-32B for ~30 steps -- the critical de-risk before
+    # the long run: does 32B (fp32 params + AdamW) FIT and train on 4x8 H100?
+    # Shorter seq (4096) for a conservative first fit; raise to 8192 once proven.
+    NAME="ota-sft-bigsmoke-32b-${TS}"
+    "${IRIS[@]}" --gpu H100x8 --replicas 4 --cpu 32 --memory 512GB --disk 300GB --max-retries 0 \
+      --job-name "${NAME}" "${ENVS[@]}" \
+      -e AGENT_MODEL qwen3-32b -e DATASET 10k -e DATA_LIMIT 8192 \
+      -e SFT_STEPS 30 -e BATCH_SIZE 32 -e LR 1e-5 -e TP 8 -e MAX_SEQ_LEN 4096 \
+      -e REMAT decoder -e RUN_NAME "${NAME}" \
+      -e EXPORT_DIR "${EXPORT_BASE}/bigsmoke-32b-${TS}/hf" \
+      -- python -m ot_agent.launch_sft
+    ;;
   full)
     # 4 nodes (32 H100): Qwen3-32B on the 100K set -- the replication run.
     # global BATCH_SIZE 32 -> 8/node; fsdp=4, tp=8; ~3 epochs of 94.3k @ bs32
@@ -78,7 +93,7 @@ case "${STAGE}" in
       -- python -m ot_agent.launch_sft
     ;;
   *)
-    echo "unknown STAGE='${STAGE}' (want: single|multi|full)" >&2
+    echo "unknown STAGE='${STAGE}' (want: single|multi|bigsmoke|full)" >&2
     exit 2
     ;;
 esac

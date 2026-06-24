@@ -83,15 +83,16 @@ change). Keys map to HF repos in `data.py` (pinned shas in `OT_AGENT_SFT_REVISIO
 
 ## Run it — the smoke ladder, then the full run
 
-`submit_sft.sh` has three rungs; **run them in order** (cheap → expensive):
+`submit_sft.sh` has four rungs; **run them in order** (cheap → expensive):
 
 ```bash
 export HF_TOKEN=...                                  # large HF pulls on the worker
 export WANDB_API_KEY=... WANDB_PROJECT=ot-agent      # optional loss curve
 
-STAGE=single bash ot_agent/submit_sft.sh   # 1 node, Qwen3-1.7B: SFT loop + export
-STAGE=multi  bash ot_agent/submit_sft.sh   # 2 nodes, Qwen3-1.7B: multi-node world + disjoint data
-STAGE=full   bash ot_agent/submit_sft.sh   # 4 nodes, Qwen3-32B: the 100K replication
+STAGE=single   bash ot_agent/submit_sft.sh # 1 node, Qwen3-1.7B: SFT loop + export
+STAGE=multi    bash ot_agent/submit_sft.sh # 2 nodes, Qwen3-1.7B: multi-node world + disjoint data
+STAGE=bigsmoke bash ot_agent/submit_sft.sh # 4 nodes, Qwen3-32B, ~30 steps: 32B memory FIT
+STAGE=full     bash ot_agent/submit_sft.sh # 4 nodes, Qwen3-32B: the 100K replication
 ```
 
 Watch (iris logs can lag on CW — the job also prints `[ota-*]` tags):
@@ -112,7 +113,10 @@ see its docstring for the full knob table (`AGENT_MODEL`, `DATASET`, `SFT_STEPS`
 | HF export = loader inverse (real tunix Qwen3) | ✅ `test_export_roundtrip.py` |
 | SFT loop trains + moves weights (PeftTrainer, CPU) | ✅ `test_sft_loop.py` |
 | `mega_eval` regression after registry edit | ✅ 46 passed |
-| multi-node JAX world + 32B on real H100 | ⏳ smoke ladder (`submit_sft.sh`) |
+| single-node H100: load → SFT → gather → HF export → R2 | ✅ smoke passed (Qwen3-1.7B, loss 0.43, exit 0) |
+| multi-node (2-node) JAX world + disjoint data | ✅ both procs one world; `p0`/`p1` read disjoint shards |
+| 32B fit + multi-node 32B train on 4×8 H100 | ⏳ `STAGE=bigsmoke` |
+| full 100K replication (4 nodes) | ⏳ `STAGE=full` (recipe TBD from paper) |
 
 CPU checks:
 ```bash

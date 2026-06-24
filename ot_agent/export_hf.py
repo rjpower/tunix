@@ -206,17 +206,29 @@ def _copy_aux_files(model_dir: str, out_dir: str) -> None:
       shutil.copy(src, os.path.join(out_dir, fn))
 
 
-def _mirror_to_s3(local_dir: str, s3_uri: str) -> None:
-  """Uploads every file under ``local_dir`` to an ``s3://`` (R2) prefix via tensorstore."""
+def _mirror_to_s3(local_dir: str, s3_uri: str, *, max_workers: int = 4) -> None:
+  """Uploads every file under ``local_dir`` to an ``s3://`` (R2) prefix via tensorstore.
+
+  Shards upload concurrently (bounded so host RAM holds ~``max_workers`` shards
+  at once): the 32B export is ~64 GB across ~13 safetensors shards, and a single
+  tensorstore stream to R2 runs ~20 MB/s, so serial upload would take ~50 min.
+  """
+  from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
   _map_r2_to_aws_env()
   bucket, _, prefix = s3_uri[len("s3://"):].partition("/")
   kv = _s3_kvstore(bucket, prefix)
   files = [os.path.relpath(os.path.join(r, f), local_dir)
            for r, _, fs in os.walk(local_dir) for f in fs]
-  for rel in files:
+
+  def _put(rel: str) -> str:
     with open(os.path.join(local_dir, rel), "rb") as fh:
       kv.write(rel, fh.read()).result()
     print(f"[ota-export] mirrored s3 <- {rel}", flush=True)
+    return rel
+
+  with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    list(ex.map(_put, files))
 
 
 def export_and_mirror(model, model_dir: str, export_dir: str, *, mesh=None,
