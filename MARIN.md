@@ -23,9 +23,16 @@ deeper home, the section points to it.
 ## 0. Orientation
 
 - **This repo** is the tunix library itself (`tunix/` = models + `rl/` + `sft/`;
-  `tunix.rl.agentic` is the multi-turn/tool-use learner). The experiments consume
-  it as a dependency (`google-tunix`, pinned `0.1.7` on PyPI). When you change the
-  fork and want it on a worker, see **§9 Developing in this fork**.
+  `tunix.rl.agentic` is the multi-turn/tool-use learner) **plus `mega_eval/`** — the
+  openthoughts-agent post-training project (Qwen3-8B SFT → gVisor-sandboxed Dr.GRPO RL)
+  layered on top in-repo. The marin experiments still consume tunix as a dependency
+  (`google-tunix`, pinned `0.1.7` on PyPI). When you change the fork and want it on a
+  worker, see **§9 Developing in this fork**.
+- **For the *codebase* (not the cluster), read `AGENTS.md`** — the repo map, the
+  de-Pathways `tunix.rl.weight_transfer` subsystem + its public seams, the
+  disaggregated separate-jobs RL system (`mega_eval/rl/`), the SFT/eval/data tracks,
+  and the code-specific gotchas. This file (MARIN.md) is the cluster/ops half; AGENTS.md
+  is the code half. The disaggregated RL *run pattern* is §13 below.
 - **iris** is marin's job orchestrator. You submit a *command* + a *resource spec*;
   iris zips your repo (working tree), `uv sync`s the lock on the worker, requests a
   TPU slice, and runs your command. You do **not** ssh to TPUs.
@@ -461,3 +468,162 @@ three `--region`s on every TPU submit; CPU-check (`JAX_PLATFORMS=cpu`) before yo
 spend a TPU; pass `top_p`; clip grads; fp32 actor params;
 `jax.distributed.initialize()` first on multi-host; `remat=NONE` to sample; prove
 `pass@k > pass@1 > 0` before RL; re-`uv lock` if stale.
+
+---
+
+## 11. Running tunix on GPU (CoreWeave H100 via iris `cw-us-east-02a`)
+
+tunix runs off-GCP on NVIDIA H100s through iris's CoreWeave cluster. **Verified
+end-to-end:** `marin_smoke.py` ran a real tunix Qwen3-0.6B forward on an H100
+(`kind='NVIDIA H100 80GB HBM3'`, jax 0.10.0/cuda13, `logits (1, 8, 151936)`, SUCCESS).
+
+### 11.1 One-time setup
+- **`gpu` optional-dependency group** (in `pyproject.toml`): `jax[cuda13]==0.10.0`,
+  `nvidia-cublas`, `nvidia-nccl-cu13`. It is **mutually exclusive with `prod`**
+  (`jax[tpu]`) via a `[tool.uv] conflicts` block — `uv` forks the lock. Submit TPU jobs
+  with `--extra prod`, GPU jobs with `--extra gpu`. Re-`uv lock` after editing it.
+- **Local CLI must reach the k8s controller:** the iris dep-group pulls
+  `marin-iris[controller]` (the `kubernetes` client). Without it, `cluster status` raises
+  `Install iris[controller] to use CloudK8sService`. Also needs `~/.kube/coreweave-iris-gpu`
+  + `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` in env (already present on this box).
+- Prove reachability first: `uv run iris --cluster=cw-us-east-02a cluster status`
+  (controller `Healthy: True`). NB: this cluster is **Pod-per-task k8s** (no Iris worker
+  daemons/autoscaler), so `cluster status` legitimately shows `Workers: 0/0` while jobs
+  still dispatch as pods onto the static 32×H100 NodePool.
+
+### 11.2 Submit pattern
+```bash
+uv run iris --cluster=cw-us-east-02a job run --no-wait \
+  --cpu 8 --memory 64GB --gpu H100x1 --enable-extra-resources --extra gpu \
+  --max-retries 1 --job-name my-gpu-job -- python my_entry.py
+```
+- `--gpu H100xN` requests N GPUs (e.g. `H100x8` for a full node); `--enable-extra-resources`
+  is required (same gate as TPU). **No `--region` flags** (single-region CoreWeave).
+- Full node: `--gpu H100x8 --cpu 32 --memory 512GB`. Multi-node uses the SDK
+  (`replicas=N`, `ports=["jax"]`, `coscheduling(group_by="leafgroup")`).
+- Data: CoreWeave **cannot read `gs://` for JAX IO** — it's wired to **R2 `s3://marin-na/…`**
+  (pods auto-get `AWS_*`/`FSSPEC_S3`). Stream HF datasets/weights on the worker; mirror
+  checkpoints to R2. NCCL uses `NCCL_SOCKET_IFNAME=enp157s0np0` (set in cluster config).
+
+### 11.3 Weight transfer / reshard on GPU
+The de-Pathways `tunix.rl.weight_transfer` backend registry selects the reshard fn by
+capability (AUTO → pathways-if-proxy else `jax_device`). On GPU there is no proxy, so the
+**`jax_device`** backend (plain `jax.device_put` cross-mesh reshard, XLA collectives = NCCL)
+is used. Colocated RL (ACTOR==ROLLOUT, or same-host disjoint meshes) uses all GPUs by
+construction (XLA collectives) — no rank-0 fold. **Verified on 8×H100
+(single node):** `reshard_pytree` moved a pytree across disjoint chip meshes
+[0:4]→[4:8] with values + physical placement correct (`OVERALL=PASS`), same as the
+TPU spike. Cross-node GPU reshard rides NCCL (untested here; the multi-node colocated
+path uses one `jax.distributed` world over `replicas=N`).
+
+### 11.4 Multi-host init guard (TPU and GPU)
+iris keys TPU multi-host off `PJRT_DEVICE=TPU`, **not** `JAX_NUM_PROCESSES` (which iris
+leaves empty) — so `marin_smoke.py`'s `JAX_NUM_PROCESSES>1` guard is a no-op on iris
+multi-host. Guard `jax.distributed.initialize()` on `PJRT_DEVICE`/`JAX_PLATFORMS startswith
+tpu` (TPU) or the GPU multi-host rendezvous env. A single v6e-8 marin slice can come back as
+1 host × 8 chips; use v6e-16 for a true 4-host test.
+
+### 11.5 Off-Pathways cross-host reshard caveat (TPU)
+Off-Pathways, **same-host** disjoint-mesh reshard is production-safe, but **cross-host**
+disjoint-mesh `device_put` returns correct values yet SIGSEGVs on teardown in XLA's
+cross-host receive notifier (v6e/jax 0.10.2). Keep trainer/rollout meshes on the same
+host(s) for colocated TPU RL; a different-host topology needs a real transport (Arrow/NCCL/
+remote control plane). On GPU this rides NCCL (not XLA TPU cross-host) — verify separately.
+
+## 12. Weight-transfer performance (measured, off-Pathways)
+Bench: `mega_eval/bench_weight_transfer.py` (env-driven: `BENCH_MODE`, `MODEL_PRESET`,
+`N_SYNC`, `SERVE_SECONDS`, `NIC_GBPS`). Model = Qwen3-8B-shaped, **15.3 GiB bf16** on the
+wire (30.5 GiB fp32 in HBM). Two transports under one registry:
+`nccl` (in-JAX-world cross-mesh reshard, XLA→NCCL) and `arrow_flight` (host-staged gRPC, the
+cross-host path that sidesteps the §11.5 SIGSEGV).
+
+**GPU — 8×H100, single node (`cw-us-east-02a`):**
+- Cross-mesh reshard ceiling (`mega_eval/reshard_probe.py`): **in-mesh 78 GB/s**,
+  **disjoint-mesh 64 GB/s**, sharded→sharded. XLA lowers `device_put` to NCCL over **all**
+  GPUs (no rank-0 fold). This is the GPU weight-sync answer — no torch / raw-NCCL needed for
+  single-node colocated sync.
+- 1 trainer (4 GPU) + 4 rollouts (1 GPU each, **replicated**): aggregate **11.5 GB/s**,
+  per-client 2.87 GB/s. The cap is **gather-to-a-single-device** (~2.9 GB/s), *not* the
+  interconnect — **shard inference targets across ≥2 GPUs (tp)** to ride the 64–78 GB/s path.
+
+**TPU — v6e-16, 4 hosts (marin), `arrow_flight` cross-NIC:**
+- 1 trainer host → 3 inference hosts, each pulling the full 15.3 GiB bf16 model, 15 rounds:
+  per-worker median **~4.5 GB/s** (best ~5.4), **aggregate ~13.5 GB/s** (≈108 Gbps — near the
+  trainer's NIC line rate). Device→host materialize 5.4 GB/s; restore/reshard 0.6–1.3 s.
+- Aggregate is capped by the **trainer's single NIC** (3 workers already saturate it); to
+  scale past one NIC, serve a shard from each trainer host.
+
+**Three transport bugs the bench surfaced (all fixed):**
+1. `serve_weights` ran a global `sync_global_devices` barrier (marin's multi-host-trainer
+   sync) that deadlocks a disaggregated trainer↔inference layout → gated behind
+   `WeightTransferConfig.serve_barrier` (default **off**; Arrow is a network transport, the
+   only collective belongs to the caller).
+2. `flatten_for_transfer` did an **on-device `reshape(-1)` of a sharded tensor** → compiles an
+   all-gather; on multi-host TPU a jit over one host's local sub-mesh makes XLA reference
+   another host's `device_id` and aborts (`RET_CHECK device_id < kMaxDeviceCount`). Fixed:
+   cast bf16 elementwise (collective-free) → `device_get` local shards → reshape on host.
+   `restore_from_flat` likewise `device_put`s the host array straight to the target sharding
+   (no single-device staging, no on-device collective).
+3. The `jax.distributed` KV coordinator used insert-only `key_value_set` → 2nd serve hit
+   `ALREADY_EXISTS` on `/latest`. Fixed: `allow_overwrite=True` + non-blocking
+   `key_value_try_get` (no per-poll 1 s timeout).
+
+---
+
+## 13. Disaggregated RL — the two-job run pattern (TPU)
+
+**For any real TPU RL run, do NOT use the in-process `RLCluster`** (`launch_rl.py`): on
+TPU it is forced to `remat=NONE` (the sampler mutates KV-cache Params, which conflicts
+with remat — Invariant 6/7) and at scale it hits the cross-host reshard SIGSEGV (§11.5)
+and the KV-cache OOM. Instead run **trainer and rollout as two SEPARATE iris jobs**, each
+its own JAX world / TPU slice, exchanging weights over **Arrow Flight** (the §11.5-safe
+cross-host transport) and trajectories over a **GCS-staged channel**. One entrypoint
+(`mega_eval/rl_disagg_loop.py`), `ROLE` selects the half. Code-level detail (the standalone
+Dr.GRPO step, the agentic collector, the env-knob table) is in **AGENTS.md §3–§4**; this is
+the *run* recipe.
+
+**Why two jobs win** (each kills a whole failure class): no shared/cross-host mesh ⇒ no
+reshard SIGSEGV; rollout chips hold only inference weights + replicated KV (no fp32
+master/AdamW) ⇒ no KV-OOM, no offload; and the **trainer can now use `remat=BLOCK`** because
+it *never samples* — the single biggest fit win (without it the agentic seq=5120 backward
+OOMs 96.7G > 31.25G even at TP=4).
+
+**Cross-job rendezvous = the iris endpoint registry**, not an object store. Both jobs build
+the SAME absolute (`/`-prefixed) name `/tunix-rl/<RUN_ID>/weights`; the leading `/` bypasses
+iris's per-job namespace so the rollout job resolves the endpoint the trainer registered.
+iris tasks run **net=host**, so the trainer's auto-bound Flight port is reachable at
+`IRIS_ADVERTISE_HOST:port` with **no iris port allocation**. (Local/GPU fallback: `COORD=s3`
++ an object-store coordinator; never S3 for TPU coordination.) Needs `marin-iris` importable
+in-job → it's in the `mega` extra.
+
+**Submit both jobs** (same `RUN_ID`, same `TRAJ_BASE`; agentic mode shown):
+
+```bash
+RUN_ID=ota-rl-$(date +%s); TRAJ=gs://marin-us-central2/users/power/tunix-rl-traj/$RUN_ID
+COMMON="--cluster=marin job run --no-wait --tpu v6e-4 --enable-extra-resources \
+  --extra prod --extra mega --region europe-west4 --region us-east1 --region us-east5 \
+  --cpu 8 --memory 64GB --disk 90GB --max-retries 1 \
+  -e RUN_ID $RUN_ID -e TRAJ_BASE $TRAJ -e PRESET qwen3-1.7b \
+  -e RL_STEPS 4 -e NUM_GENERATIONS 2 -e PROMPTS_PER_BATCH 1 -e REWARD_MODE agentic \
+  -e TASK_LIMIT 1 -e MAX_STEPS 6 -e MAX_RESPONSE_LEN 1024 -e MAX_PROMPT_LEN 4096"
+
+uv run iris $COMMON -e ROLE trainer --job-name ota-rl-trainer -- python -m mega_eval.rl_disagg_loop
+uv run iris $COMMON -e ROLE rollout --job-name ota-rl-rollout -- python -m mega_eval.rl_disagg_loop
+```
+
+- **`RUN_ID` and `TRAJ_BASE` MUST match** across the two jobs (the registry name and the GCS
+  channel are derived from them). `RUN_ID` is required for `COORD=iris`.
+- **Order doesn't matter** — the rollout polls `receive_weights` until the trainer serves
+  `weight_id=0`, and the trainer waits on `wait_for_batch`. Submit both, then watch:
+  `iris job summary /power/ota-rl-trainer`, `iris job logs … | grep '\[m1c\]'`.
+- **Disk ≤ 90GB** per VM (§2). **`REMAT=block`** is the default and safe here (trainer never
+  samples). `--disk` only needs to hold the per-task gVisor images (§2 vfs note).
+- **`reward=0.0` on a base model is expected** — the loop is *mechanically* correct but a 1.7B
+  base model can't solve Terminal-Bench. Point `PRESET`/`CKPT_DIR` at the **SFT checkpoint** for
+  real signal, and gate tasks by `score_spread > 0` first (§4 / AGENTS.md §6).
+
+**Validated ladder (all GREEN on marin, two separate v6e-4 jobs, exit 0):** M0 byte-exact
+cross-job Arrow (`rl_rendezvous_smoke.py`) → M1a real-weights pull+generate (`rl_disagg_smoke.py`)
+→ M1c full placeholder loop (`rl_disagg_loop.py`, wid 0→3) → **M1d real agentic Terminal-Bench
+reward** (`REWARD_MODE=agentic`, commit `4304d76`; survived a TPU preemption). The infra
+build-out (M0–M1d) is complete; the open work is *quality* (run from the SFT checkpoint).

@@ -26,3 +26,7 @@
 /docs/sg_execution_times.rst
 /docs/generated
 build/*
+scratchpad/
+s3:/
+.claude/
+_traj/

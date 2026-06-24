@@ -18,7 +18,6 @@ from concurrent import futures
 import functools
 # Keep this import for google internal usage.
 import math  # pylint: disable=unused-import
-import os
 import threading
 import time
 from typing import Any, Callable
@@ -28,6 +27,7 @@ import jax
 import jaxtyping
 from flax import nnx
 from tunix.rl import utils
+from tunix.utils import env_utils
 
 # TODO(tsbao): move this to util
 def callback_on_ready(
@@ -87,7 +87,8 @@ def _get_reshard_fn_pathwaysutils(
     )
     raise
   else:
-    if 'proxy' not in os.getenv('JAX_PLATFORMS', ''):
+    # Single source of truth for the 'proxy' in JAX_PLATFORMS capability.
+    if not env_utils.is_pathways_proxy_backend():
       raise EnvironmentError(
           'Pathways proxy is not available. Make sure you have enabled Pathways'
           ' proxy as jax backend, e.g. os.environ["JAX_PLATFORMS"] = "proxy".'
@@ -154,6 +155,7 @@ def _get_reshard_fn(
   Returns:
     A reshard function.
   """
+  last_exc: Exception | None = None
   for get_reshard_fn in get_reshard_fns:
     try:
       reshard_fn = get_reshard_fn(
@@ -161,12 +163,18 @@ def _get_reshard_fn(
           donate=donate,
           use_experimental_pre_reshard=use_experimental_pre_reshard,
       )
-    except (ImportError, EnvironmentError):
-      logging.debug('Could not support {get_reshard_fn=}.', exc_info=True)
+    except (ImportError, EnvironmentError) as e:
+      last_exc = e
+      logging.debug('Could not support %r.', get_reshard_fn, exc_info=True)
     else:
       return reshard_fn
 
-  raise ValueError('Could not find a reshard function from {get_reshard_fns=}.')
+  # Chain the last underlying capability error so an explicitly-requested backend
+  # (e.g. PATHWAYS without the proxy enabled) reports the real reason, not just a
+  # generic "no fn found".
+  raise ValueError(
+      f'Could not find a usable reshard function from {get_reshard_fns!r}.'
+  ) from last_exc
 
 
 def reshard_pytree(
@@ -175,10 +183,16 @@ def reshard_pytree(
     cache_plan: bool = True,
     donate_input: bool = False,
     use_experimental_pre_reshard: bool = True,
+    *,
+    reshard_fns: list[Callable[..., Any]] | None = None,
 ) -> jaxtyping.PyTree:
   """Reshard input pytree from source sharding and mesh to target sharding and mesh.
 
   From source to target, both the sharding and mesh can be different.
+
+  This keeps its synchronous ``source + target -> pytree`` local semantics: it
+  is used both for weight sync and for model load/relocate, so it does not do
+  any remote transport.
 
   Args:
     source: The input source pytree to reshard.
@@ -190,10 +204,21 @@ def reshard_pytree(
     donate_input: Whether to donate the input (source) to the reshard.
     use_experimental_pre_reshard: Whether to use the experimental pre-reshard
       API.
+    reshard_fns: Optional ordered list of reshard-backend factories to try, as
+      returned by `weight_transfer.select_reshard_fns`. When None, the AUTO
+      backend list (Pathways then ``jax.device_put``) is used, which is
+      byte-identical to the historical fallback order.
 
   Returns:
     The resharded pytree.
   """
+  if reshard_fns is None:
+    # Lazy import avoids a module-level cycle: weight_transfer imports reshard.
+    from tunix.rl import weight_transfer  # pylint: disable=g-import-not-at-top
+
+    reshard_fns = weight_transfer.select_reshard_fns(
+        weight_transfer.LocalReshardBackend.AUTO
+    )
 
   def _get_dst_sharding(x):
     if isinstance(
@@ -216,11 +241,7 @@ def reshard_pytree(
       cache_resharding_plans=cache_plan,
       donate=donate_input,
       use_experimental_pre_reshard=use_experimental_pre_reshard,
-      get_reshard_fns=[
-          #
-          _get_reshard_fn_pathwaysutils,
-          _get_reshard_fn_jax_device_put,
-      ],
+      get_reshard_fns=reshard_fns,
   )
 
   start = time.time()

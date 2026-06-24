@@ -22,6 +22,7 @@ from absl import logging
 from flax import nnx
 import jax
 import orbax.checkpoint as ocp
+from tunix.utils import env_utils
 
 _DEFAULT_CHECKPOINTING_OPTIONS = ocp.CheckpointManagerOptions(
     save_decision_policy=ocp.checkpoint_managers.ContinuousCheckpointingPolicy(
@@ -49,8 +50,9 @@ class CheckpointManager:
     self._checkpoint_manager: ocp.CheckpointManager | None = None
     if root_directory is not None:
       # When using Pathways, the checkpoint manager only supports persistence
-      # APIs now.
-      if 'proxy' in os.getenv('JAX_PLATFORMS', ''):
+      # APIs now. Route the 'proxy' in JAX_PLATFORMS capability through the
+      # single source of truth in env_utils; behavior is unchanged.
+      if env_utils.is_pathways_proxy_backend():
         item_handlers = {
             'model_params': ocp.PyTreeCheckpointHandler(
                 use_ocdbt=False,

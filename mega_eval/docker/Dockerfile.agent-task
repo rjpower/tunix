@@ -1,0 +1,88 @@
+# Custom iris TASK image for the OpenThoughts agent: the stock iris task base
+# (uv + python + rust + node, deps installed per-job via `uv sync`) plus the
+# sandboxing runtime the agent needs to execute untrusted tool / shell commands.
+#
+# Build context: this directory (only this Dockerfile + nothing else is needed;
+# we derive everything from the published iris-task base).
+#
+#   docker buildx build --platform linux/amd64 \
+#     -f docker/Dockerfile.agent-task \
+#     -t ghcr.io/<org>/openthoughts-agent-task:latest --push .
+#
+# Select it per-job with `iris job run --task-image ghcr.io/<org>/openthoughts-agent-task:latest`.
+# Iris auto-rewrites the ghcr.io tag to the per-region Artifact Registry mirror.
+#
+# Why a custom image: iris runs `cd /app; uv sync; exec <cmd>` in this image, so it
+# must keep uv/python/bash (inherited from the base). On a TPU task the run
+# container is `--privileged` (iris adds it for accelerators), which is enough to
+# run rootful gVisor (runsc) for isolated tool execution. The iris authors
+# explicitly intend `--task-image` for "an image with runsc/skopeo for sandboxing
+# untrusted child workloads".
+
+FROM ghcr.io/marin-community/iris-task:latest
+
+# --- Docker engine + CLI (to build & run each Terminal-Bench task's own image) ---
+# Terminal-Bench tasks ship a Dockerfile defining their environment; we run those
+# images with gVisor as the OCI runtime (`docker run --runtime=runsc`). dockerd is
+# started at task time (see eval/sandbox.py), which needs the --privileged the TPU
+# task container already has.
+#
+# Use Docker's official static binaries (the standard DinD approach) rather than
+# the distro `docker.io` package, which did not reliably land the `docker` CLI on
+# this slim base. iptables/uidmap are still needed by dockerd at runtime.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        iptables uidmap ca-certificates wget xz-utils; \
+    rm -rf /var/lib/apt/lists/*
+
+ARG DOCKER_VERSION=27.3.1
+RUN set -eux; \
+    wget -q "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" -O /tmp/docker.tgz; \
+    tar -xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1; \
+    rm -f /tmp/docker.tgz; \
+    docker --version; \
+    dockerd --version
+
+# Docker 27 dropped the legacy builder; `docker build` needs the buildx (BuildKit)
+# CLI plugin, which the static tarball above does not include.
+ARG BUILDX_VERSION=0.17.1
+RUN set -eux; \
+    mkdir -p /usr/local/lib/docker/cli-plugins; \
+    wget -q "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-amd64" \
+        -O /usr/local/lib/docker/cli-plugins/docker-buildx; \
+    chmod a+rx /usr/local/lib/docker/cli-plugins/docker-buildx; \
+    docker buildx version
+
+# --- gVisor (runsc) ---
+# Pinned to a release for reproducibility; bump deliberately.
+ARG GVISOR_ARCH=x86_64
+ARG GVISOR_RELEASE=release/latest
+RUN set -eux; \
+    URL="https://storage.googleapis.com/gvisor/releases/${GVISOR_RELEASE}/${GVISOR_ARCH}"; \
+    wget -q "${URL}/runsc" "${URL}/runsc.sha512" \
+            "${URL}/containerd-shim-runsc-v1" "${URL}/containerd-shim-runsc-v1.sha512"; \
+    sha512sum -c runsc.sha512 -c containerd-shim-runsc-v1.sha512; \
+    rm -f ./*.sha512; \
+    chmod a+rx runsc containerd-shim-runsc-v1; \
+    mv runsc containerd-shim-runsc-v1 /usr/local/bin/; \
+    runsc --version
+
+# Register runsc as a Docker runtime, defaulting to the ptrace platform (no /dev/kvm
+# is passed into iris tasks). `--ignore-cgroups` is required because the iris task
+# container's cgroup is delegated/restricted, so runsc can't write subtree_control
+# to set up a child cgroup (it would fail with "operation not supported").
+# Containers opt in with `docker run --runtime=runsc`.
+RUN mkdir -p /etc/docker && \
+    printf '%s\n' \
+      '{' \
+      '  "runtimes": {' \
+      '    "runsc": {' \
+      '      "path": "/usr/local/bin/runsc",' \
+      '      "runtimeArgs": ["--platform=ptrace", "--network=sandbox", "--ignore-cgroups"]' \
+      '    }' \
+      '  }' \
+      '}' > /etc/docker/daemon.json
+
+# Sanity: the base image's uv must still be on PATH (iris relies on it).
+RUN command -v uv && command -v runsc && command -v docker

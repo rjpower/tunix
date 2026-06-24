@@ -175,6 +175,28 @@ class UtilsTest(absltest.TestCase):
     with self.assertRaisesRegex(ValueError, 'memory_kind must be one of'):
       utils.put_params_on_memory_kind(params, 'invalid_kind')
 
+  def test_put_params_on_memory_kind_moves_mixed_tree(self):
+    # Regression: a MIXED tree (some leaves already on the target kind) must move
+    # the remaining leaves, not early-return unchanged. The old tree-wide OR
+    # short-circuit ("any leaf on device" => skip move to device) stranded an
+    # offloaded leaf on host, crashing the rollout prefill's embedding gather
+    # ("memory_space of all inputs passed to gather must be the same").
+    on_host = utils.put_params_on_memory_kind(
+        {'emb': jnp.array([1.0, 2.0])}, 'pinned_host'
+    )['emb']
+    on_device = jnp.array([3.0])  # default device sharding
+    mixed = {'emb': on_host, 'small': on_device}
+
+    moved = utils.put_params_on_memory_kind(mixed, 'device')
+    self.assertEqual(
+        jax.tree.map(lambda x: x.sharding.memory_kind, moved),
+        {'emb': 'device', 'small': 'device'},
+    )
+
+    # And the all-on-target fast path still returns the tree untouched.
+    again = utils.put_params_on_memory_kind(moved, 'device')
+    self.assertIs(moved, again)
+
   def test_pack_sequences(self):
     def _create_mock_train_example(
         prompt_len: int, completion_len: int

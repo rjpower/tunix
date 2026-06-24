@@ -290,10 +290,20 @@ def _device_family(devices: Sequence[Any]) -> str | None:
 def _device_host_key(device: Any) -> tuple[Any, ...] | None:
   """Returns a stable per-host key when runtime metadata exposes one.
 
-  Pathways does not expose a per-host task attribute, so the task component is
-  parsed from the device repr; the slice component is still read from the
-  ``slice_index`` attribute, which Pathways does expose. On non-Pathways
-  backends the task component is the ``process_index`` attribute.
+  Both Pathways and standard multi-controller JAX are supported, gated on the
+  `_is_pathways_backend_used()` capability check (not a blind stub):
+
+  * Pathways does not expose a per-host task attribute as a Python attribute, so
+    the task component is parsed out of ``repr(device)`` (``logical_task``); the
+    slice component is read from the ``slice_index`` attribute, which Pathways
+    does expose.
+  * On standard JAX (CPU/GPU/TPU without Pathways) the task component is the
+    standard ``process_index`` attribute, so distinct hosts/controllers get
+    distinct keys -- this keeps host grouping and mesh allocation (mesh.py)
+    correct off-Pathways. The slice component is ``slice_index`` when the
+    runtime exposes it (multi-slice TPU) and ``None`` otherwise (CPU/GPU), in
+    which case all devices share one slice -- the right behavior for a flat,
+    single-slice topology.
 
   Args:
     device: JAX device or test double.
