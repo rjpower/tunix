@@ -80,14 +80,17 @@ case "${STAGE}" in
     ;;
   full)
     # 4 nodes (32 H100): Qwen3-32B on the 100K set -- the replication run.
-    # global BATCH_SIZE 32 -> 8/node; fsdp=4, tp=8; ~3 epochs of 94.3k @ bs32
-    # is ~8800 steps. Tune SFT_STEPS/LR per the paper's recipe.
+    # Recipe from the released OpenThinkerAgent-32B-SFT-100K model card:
+    #   lr 4e-5, cosine + warmup_ratio 0.1, global_batch 96, 5 epochs, bf16.
+    # 5 epochs of 94,334 rows @ global batch 96 = ceil(5*94334/96) = 4914 steps.
+    # global 96 -> 24/node; fsdp=4, tp=8 (96 % 4 == 0, 96 % 4 procs == 0).
     NAME="ota-sft-qwen3-32b-100k-${TS}"
     "${IRIS[@]}" --gpu H100x8 --replicas 4 --cpu 32 --memory 512GB --disk 300GB --max-retries 1 \
       --job-name "${NAME}" "${ENVS[@]}" \
       -e AGENT_MODEL qwen3-32b -e DATASET 100k \
-      -e SFT_STEPS "${SFT_STEPS:-8800}" -e BATCH_SIZE "${BATCH_SIZE:-32}" \
-      -e LR "${LR:-1e-5}" -e TP "${TP:-8}" -e MAX_SEQ_LEN "${MAX_SEQ_LEN:-8192}" \
+      -e SFT_STEPS "${SFT_STEPS:-4914}" -e BATCH_SIZE "${BATCH_SIZE:-96}" \
+      -e LR "${LR:-4e-5}" -e WARMUP_RATIO "${WARMUP_RATIO:-0.1}" \
+      -e TP "${TP:-8}" -e MAX_SEQ_LEN "${MAX_SEQ_LEN:-8192}" \
       -e REMAT "${REMAT:-decoder}" -e RUN_NAME "${NAME}" \
       -e EXPORT_DIR "${EXPORT_BASE}/qwen3-32b-100k-${TS}/hf" \
       -- python -m ot_agent.launch_sft

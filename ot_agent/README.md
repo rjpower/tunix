@@ -102,7 +102,17 @@ uv run iris --cluster=cw-us-east-02a job logs /power/<job-name> --follow | grep 
 
 The entrypoint is `python -m ot_agent.launch_sft`, configured entirely by env —
 see its docstring for the full knob table (`AGENT_MODEL`, `DATASET`, `SFT_STEPS`,
-`BATCH_SIZE` (global), `LR`, `MAX_SEQ_LEN`, `TP`, `REMAT`, `EXPORT_DIR`, …).
+`BATCH_SIZE` (global), `LR`, `WARMUP_RATIO`, `MAX_SEQ_LEN`, `TP`, `REMAT`,
+`EXPORT_DIR`, …).
+
+### The full-run recipe (from the released `OpenThinkerAgent-32B-SFT-100K` card)
+
+The `STAGE=full` defaults reproduce the paper's recipe: **LR 4e-5**, **cosine
+schedule + warmup_ratio 0.1**, **global batch 96**, **5 epochs** (= `ceil(5 ×
+94,334 / 96)` = **4914 steps**), bf16 (the card's ZeRO-3 keeps an fp32 master —
+matching our fp32-params / bf16-compute setup). `MAX_SEQ_LEN` is not stated on the
+card; we use 8192 (the precedent's fitted envelope). Override any via env, e.g.
+`MAX_SEQ_LEN=16384 STAGE=full bash ot_agent/submit_sft.sh`.
 
 ## Validation status
 

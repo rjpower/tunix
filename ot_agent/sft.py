@@ -23,11 +23,37 @@ from typing import Any
 
 import grain.python as grain
 import jax
+import optax
 import orbax.checkpoint as ocp
 
 from tunix.sft.peft_trainer import PeftTrainer, TrainingConfig
 
 from mega_eval.training.common import clipped_adamw, sft_model_input_fn
+
+
+def build_optimizer(peak_lr: float, total_steps: int, warmup_ratio: float = 0.0):
+  """Global-norm-clipped AdamW, optionally with a cosine+warmup LR schedule.
+
+  ``warmup_ratio <= 0`` reuses ``mega_eval``'s constant-LR ``clipped_adamw`` (the
+  proven default). ``warmup_ratio > 0`` matches the OpenThoughts-Agent paper
+  recipe (lr_scheduler_type=cosine, warmup_ratio 0.1): linear warmup over
+  ``warmup_ratio * total_steps`` then cosine decay to ~0. The global-norm clip is
+  load-bearing (unclipped AdamW can NaN and crash), so it wraps both paths.
+  """
+  if warmup_ratio and warmup_ratio > 0.0:
+    warmup_steps = max(1, int(warmup_ratio * total_steps))
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=peak_lr,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
+        end_value=0.0,
+    )
+    return optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=schedule, b1=0.9, b2=0.99, weight_decay=0.0),
+    )
+  return clipped_adamw(peak_lr)
 
 
 def run_sharded_sft(
@@ -38,6 +64,7 @@ def run_sharded_sft(
     steps: int,
     learning_rate: float,
     mesh: jax.sharding.Mesh,
+    warmup_ratio: float = 0.0,
     checkpoint_dir: str | None = None,
     save_interval_secs: int = 600,
     max_to_keep: int = 2,
@@ -63,7 +90,7 @@ def run_sharded_sft(
   Returns:
     The same ``model`` object, now SFT'd.
   """
-  optimizer = clipped_adamw(learning_rate)
+  optimizer = build_optimizer(learning_rate, steps, warmup_ratio)
 
   checkpointing_options = None
   if checkpoint_dir:

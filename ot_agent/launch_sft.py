@@ -21,6 +21,8 @@ Config via env (all optional unless noted):
   * ``DATASET`` (100k) -- OT-Agent ladder key (1k|3.16k|10k|31.6k|100k|
     coldstart-10k|v1) or a full HF dataset id. ``DATASET_REVISION`` (default branch).
   * ``SFT_STEPS`` (2000), ``BATCH_SIZE`` (32, the GLOBAL batch), ``LR`` (1e-5).
+  * ``WARMUP_RATIO`` (0.0 = constant LR; the paper uses 0.1 = cosine schedule
+    with linear warmup over the first 10% of steps then cosine decay to ~0).
   * ``MAX_SEQ_LEN`` (8192), ``SEED`` (0), ``TP`` (8; tensor-parallel width,
     must divide num_kv_heads=8 and the per-node device count).
   * ``DATA_LIMIT`` (unset = all rows) -- cap global rows scanned (smoke knob).
@@ -81,6 +83,7 @@ def main() -> None:
   steps = int(os.environ.get("SFT_STEPS", "2000"))
   global_batch = int(os.environ.get("BATCH_SIZE", "32"))
   learning_rate = float(os.environ.get("LR", "1e-5"))
+  warmup_ratio = float(os.environ.get("WARMUP_RATIO", "0.0"))
   max_seq_len = int(os.environ.get("MAX_SEQ_LEN", "8192"))
   seed = int(os.environ.get("SEED", "0"))
   tp = int(os.environ.get("TP", "8"))
@@ -158,8 +161,9 @@ def main() -> None:
       config={
           "stage": "sft", "model": model_spec.name, "dataset": repo_id,
           "steps": steps, "global_batch": global_batch, "lr": learning_rate,
-          "max_seq_len": max_seq_len, "tp": tp, "fsdp": fsdp,
-          "processes": process_count, "remat": os.environ.get("REMAT", "decoder"),
+          "warmup_ratio": warmup_ratio, "max_seq_len": max_seq_len,
+          "tp": tp, "fsdp": fsdp, "processes": process_count,
+          "remat": os.environ.get("REMAT", "decoder"),
       },
   )
 
@@ -169,6 +173,7 @@ def main() -> None:
       steps=steps,
       learning_rate=learning_rate,
       mesh=mesh,
+      warmup_ratio=warmup_ratio,
       checkpoint_dir=checkpoint_dir,
       metrics_options=metrics,
   )
