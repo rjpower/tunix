@@ -208,8 +208,8 @@ def build_config() -> train_lm.TrainLmConfig:
         # shard (else they replicate -> the 50GB activation OOM). No-op at TP=1.
         #
         # vocab->model is in param_mapping ONLY, NOT compute_mapping. The big-vocab
-        # CE cost is handled by the fused Pallas GPU streaming kernel (engaged via
-        # _patch_fused_ce_block_size -> block_size=64), which tiles over vocab and
+        # CE cost is handled by the GPU streaming CE kernel (engaged with low-unroll
+        # block sizes via _patch_fused_ce_block_sizes), which tiles over vocab and
         # never materializes the [seq, 151672] logits. That kernel's shard_map
         # (levanter/models/loss.py) shards only the BATCH axis and keeps the FULL
         # vocab + hidden on each device -- it does NO cross-vocab-shard reduction.
@@ -297,44 +297,61 @@ def _patch_levanter_vocab_resize() -> None:
     hfc.HFCheckpointConverter.load_pretrained = patched
 
 
-def _patch_fused_ce_block_size(v_block: int = 64) -> None:
-    """Force the fused cross-entropy onto the Pallas GPU *streaming* kernel.
+def _patch_fused_ce_block_sizes(h_block: int = 16, v_block: int = 2048) -> None:
+    """Engage the GPU streaming CE kernel with block sizes that DON'T explode compile.
 
-    THE 32B@32k FIT HINGES ON THIS. Without it, the loss silently falls back to
-    the XLA path, which all-gathers the vocab and materializes the full
-    ``[seq, 151672]`` fp32 logits + gradient (~38GiB) on one device -> OOM. The
-    Pallas GPU kernel instead tiles over the vocab and never materializes them.
+    THE 32B@32k FIT AND A SANE COMPILE BOTH HINGE ON THIS. Two coupled problems:
 
-    Why the fallback happens by default: ``maybe_fused_next_token_loss`` is called
-    with ``block_size=None``, so the kernel infers block sizes from a tuned table
-    (``tuned_block_sizes.py``). That table has NO shape bucket for Qwen3-32B's
-    hidden=5120 (its NVIDIA buckets cap at h=4096 "llama3-ish" / h<=3072), so it
-    returns ``BlockSizes.get_default()`` = (b=1024, h=512, v=1024). On H100 the
-    Pallas weight tile must fit ~101KB of shared memory: 512*1024*2B = 1MB >> 101KB,
-    so ``pallas_gpu`` raises PallasUnsupportedError and the kernel falls back to XLA.
+    1. WRONG DEFAULT -> XLA fallback (the OOM). ``maybe_fused_next_token_loss`` calls
+       the kernel with ``block_size=None``, so it infers block sizes from a tuned
+       table that has NO bucket for Qwen3-32B's hidden=5120 (NVIDIA buckets cap at
+       h=4096). It returns ``BlockSizes.get_default()`` = (b=1024, h=512, v=1024); on
+       H100 the kernel's weight tile must fit ~101KB shared memory and 512*1024*2B =
+       1MB >> 101KB, so ``pallas_gpu`` rejects it and the CE falls back to the XLA
+       path -- which all-gathers the vocab and materializes the full [seq, 151672]
+       fp32 logits+grad (~38GiB) -> OOM.
 
-    The fix: pass an explicit ``block_size`` (= the kernel's ``v_block_size``),
-    which both *bypasses* the broken inference AND keeps the default h=512:
-    512 * 64 * 2B = 64KB < 101KB -> the tile fits and ``pallas_gpu`` (the default
-    first-choice impl on GPU) runs. v_block=64 is the largest power of two that
-    fits with h=512 (v=128 -> 128KB > budget). ``compute_next_token_loss`` doesn't
-    thread a block_size and ``TrainLmConfig`` exposes no knob, so we inject it by
-    wrapping ``maybe_fused_next_token_loss`` where the model imported it
-    (``lm_model``); Qwen3 inherits that base ``compute_next_token_loss`` unchanged.
+    2. SMALL v_block -> giant unroll (the 20-min compile). On JAX 0.10 the GPU CE
+       forward is NOT a real Triton/Pallas kernel -- Mosaic GPU can't lower the tiled
+       pallas_call dot_general yet, so pallas_gpu.py runs ``_fa_style_streaming``, a
+       JAX function whose vocab loop is a PYTHON ``for`` over num_v_blocks =
+       ceil(V / v_block). That loop UNROLLS at trace time. The only int knob
+       (``block_size``) keeps h=512, so the largest gate-legal v is 64 ->
+       num_v_blocks = ceil(151680/64) = 2370 -> a ~20-minute HLO unroll (the backward
+       is already a lax.scan, but the forward unrolls).
+
+    The fix sets BOTH blocks via the kernel's ``infer_block_sizes_with_tuned_match``:
+    h_block=16 only PADS the hidden (5120 is already %16, and the streaming
+    dot_general contracts the FULL hidden, so h_block is otherwise inert), which lets
+    v_block rise to 2048 under the shared-mem gate (16*2048*2B = 64KB <= 101KB). That
+    drops num_v_blocks to ceil(151680/2048) = 75 -- a ~30x smaller forward unroll, so
+    the step compiles in a couple minutes. Returning has_tuned_match=True makes the
+    api use these directly (no autotune sweep), and the gate-legal tile keeps the CE
+    on ``pallas_gpu`` (no XLA fallback, no 38GiB logits). Patched at the kernel-api
+    level so ``block_size`` stays None and the model code is untouched.
     """
-    import levanter.models.lm_model as lmm
+    import levanter.kernels.pallas.fused_cross_entropy_loss.api as ce_api
+    from levanter.kernels.pallas.fused_cross_entropy_loss.config import BlockSizes
 
-    orig = lmm.maybe_fused_next_token_loss
+    orig = ce_api.infer_block_sizes_with_tuned_match
     if getattr(orig, "_ota_block_patched", False):
         return
 
-    def patched(*args, **kwargs):
-        kwargs.setdefault("block_size", v_block)
-        return orig(*args, **kwargs)
+    tuned = BlockSizes(b_block_size=1024, h_block_size=h_block, v_block_size=v_block)
+
+    def patched(b, h, v, *, dtype=None, x_dtype=None, w_dtype=None, device_kind=None):
+        # Only large-hidden (Qwen3-32B = 5120) lacks a tuned bucket and hits the
+        # oversized default; small models keep upstream's tuned choices.
+        if h > 3072:
+            return tuned, True
+        return orig(b, h, v, dtype=dtype, x_dtype=x_dtype, w_dtype=w_dtype, device_kind=device_kind)
 
     patched._ota_block_patched = True
-    lmm.maybe_fused_next_token_loss = patched
-    logger.info("OTA: forcing fused CE onto Pallas GPU streaming kernel (block_size=%d)", v_block)
+    ce_api.infer_block_sizes_with_tuned_match = patched
+    logger.info(
+        "OTA: fused CE block sizes -> b=1024 h=%d v=%d (forward unroll ~= ceil(V/%d))",
+        h_block, v_block, v_block,
+    )
 
 
 def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
@@ -395,9 +412,10 @@ def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
 
 
 if __name__ == "__main__":
-    # Always engage the Pallas GPU streaming CE (see _patch_fused_ce_block_size):
-    # the XLA fallback OOMs at 32B@32k regardless of warm-start vs fresh-HF init.
-    _patch_fused_ce_block_size(int(_env("OTA_CE_VBLOCK", "64")))
+    # Always engage the GPU streaming CE with low-unroll block sizes (see
+    # _patch_fused_ce_block_sizes): the XLA fallback OOMs at 32B@32k, and a too-small
+    # v_block makes the forward unroll explode the compile -- regardless of init path.
+    _patch_fused_ce_block_sizes(int(_env("OTA_CE_HBLOCK", "16")), int(_env("OTA_CE_VBLOCK", "2048")))
     _init_from = _env("OTA_INIT_FROM", "").rstrip("/")
     if _init_from:
         _patch_load_pretrained_from_checkpoint(_init_from)
