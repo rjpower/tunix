@@ -123,10 +123,16 @@ HF export every 11 steps. Deliverables: validated 100K cache build, a partial-SF
 Qwen3-32B checkpoint (~2% of one epoch) as the RL-phase seed, and the throughput
 numbers above. Sizing chosen so the cosine schedule completes inside 12h.
 
-Confirmed live: the 100K cache built in ~15–20 min via Levanter's distributed
-"zephyr" tokenizer pool (10 shards), and the **first train step on real 100K data
-completed in 821.3 s** — matching the 1K-probe step time exactly, so the ~815 s/
-step (~1,286 tok/s) model holds on the real corpus.
+Confirmed live (job `/power/ota-levanter-32b-1782367494`): the 100K cache built in
+~15–20 min via Levanter's distributed "zephyr" tokenizer pool (10 shards); the
+**first train step on real 100K data completed in 821.3 s** (steady ~815–825 s/
+step — the ~1,286 tok/s model holds on the real corpus); loss decreasing
+(0.40 → 0.32 by step 10); the **2-hourly train-state checkpoint writes to S3**
+(resume de-risked); and the **bf16 HF export works end-to-end** — 14 safetensors
+shards of ~4.97 GB (= ~70 GB bf16; fp32 would be 28 shards / 131 GB), written
+shard-by-shard to S3 with no host OOM at the 256GB default. So the full
+**train → S3 checkpoint → bf16 HF export → RL seed** path is validated end-to-end.
+RL-seed location: `s3://marin-na/users/power/ot-agent-levanter/32b-openthoughts-agent-sft-100k-100k-12h/hf/<job>/step-<N>`.
 
 ## Suitability bottom line
 
