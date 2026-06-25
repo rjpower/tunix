@@ -58,11 +58,41 @@ def _qwen3_1_7b_base_spec() -> ModelSpec:
   )
 
 
+def _qwen3_32b_spec() -> ModelSpec:
+  # The OpenThoughts-Agent paper (arXiv:2606.24855) SFTs ``Qwen/Qwen3-32B`` on
+  # the 100K agent set; this is the ``ot_agent`` replication target on 4x8 H100.
+  # The generic ``load_qwen3`` loader reads ``config.json`` and matches tunix's
+  # built-in ``ModelConfig.qwen3_32b`` preset (64 layers, embed 5120, no
+  # rope_scaling, untied embeddings) -- no model-code change for 32B.
+  from mega_eval.models.qwen3_loader import load_qwen3, load_qwen3_tokenizer
+
+  return ModelSpec(
+      name="qwen3-32b",
+      repo="Qwen/Qwen3-32B",
+      load_model=load_qwen3,
+      load_tokenizer=load_qwen3_tokenizer,
+  )
+
+
+def _qwen3_32b_base_spec() -> ModelSpec:
+  # Base-model ablation arm (raw LM rather than the released chat model).
+  from mega_eval.models.qwen3_loader import load_qwen3, load_qwen3_tokenizer
+
+  return ModelSpec(
+      name="qwen3-32b-base",
+      repo="Qwen/Qwen3-32B-Base",
+      load_model=load_qwen3,
+      load_tokenizer=load_qwen3_tokenizer,
+  )
+
+
 # Name -> factory (lazy so importing this module doesn't import the loader).
 _REGISTRY: dict[str, Callable[[], ModelSpec]] = {
     "qwen3-8b": _qwen3_8b_spec,
     "qwen3-8b-base": _qwen3_8b_base_spec,
     "qwen3-1.7b-base": _qwen3_1_7b_base_spec,
+    "qwen3-32b": _qwen3_32b_spec,
+    "qwen3-32b-base": _qwen3_32b_base_spec,
 }
 
 

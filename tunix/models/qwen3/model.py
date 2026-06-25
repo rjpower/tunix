@@ -44,6 +44,29 @@ LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
 
 
+def _flash_attention_backend() -> str:
+  """Which flash-attention kernel to dispatch to for the current devices.
+
+  ``'tpu'`` -> the pallas ``splash`` kernel (this file's original path).
+  ``'gpu'`` -> cuDNN flash attention via ``jax.nn.dot_product_attention``.
+  ``'cpu'`` (or anything else) -> the portable ``xla`` flash path (used for
+  tests; production GPU/TPU never hit it).
+
+  tunix shipped only the TPU splash kernel, so ``use_flash_attention`` was a
+  no-op-to-OOM on GPU at long context. The GPU branch makes long-context
+  (e.g. 32k) training/RL viable on H100s (cuDNN flash is O(seq) memory). We read
+  the active mesh's device platform (robust under ``jit``/``shard_map``) and fall
+  back to the default backend.
+  """
+  try:
+    mesh = pxla.thread_resources.env.physical_mesh
+    if mesh is not None and getattr(mesh, "devices", None) is not None and mesh.devices.size:
+      return mesh.devices.flat[0].platform
+  except Exception:  # pragma: no cover - defensive; fall back below
+    pass
+  return jax.default_backend()
+
+
 def round_up_to_base(x: int, base: int, threshold: int | None = None) -> int:
   if threshold is not None and x < threshold:
     return threshold
@@ -613,7 +636,33 @@ class Attention(nnx.Module):
     _, _, kh, _ = key_proj.shape
 
     # NB: flash attention doesn't work for decoding step
-    if self.config.use_flash_attention and seq_len > 1:
+    if (
+        self.config.use_flash_attention
+        and seq_len > 1
+        and _flash_attention_backend() != 'tpu'
+    ):
+      # ---- GPU (cuDNN) / CPU (xla) flash path -------------------------------
+      # tunix's splash kernel is TPU-only; jax.nn.dot_product_attention provides
+      # cuDNN flash attention on GPU (O(seq) memory -> long context fits). Keep
+      # the [B,T,N,H] layout it expects (no transpose), and let it do GQA
+      # natively (qh is a multiple of kh). is_causal applies the causal mask;
+      # for unpacked, right-padded SFT/RL inputs that is exactly equivalent to
+      # this file's materialized causal+padding mask on every *scored* token
+      # (real queries never attend pad keys under causal + right padding; pad
+      # queries are loss-masked). Sequence packing on GPU flash (segment_ids
+      # with >1 segment) is not yet supported here -> falls back via the flag.
+      backend = _flash_attention_backend()
+      qkv = jax.nn.dot_product_attention(
+          query_proj,
+          key_proj,
+          value_proj,
+          scale=self.scale,
+          is_causal=True,
+          implementation='cudnn' if backend == 'gpu' else 'xla',
+      )
+      qkv = shard(qkv, self.shd_config.act_btnh)
+    elif self.config.use_flash_attention and seq_len > 1:
+      # ---- TPU splash path (original) ---------------------------------------
       query_proj = query_proj.transpose(0, 2, 1, 3)
       key_proj = key_proj.transpose(0, 2, 1, 3)
       value_proj = value_proj.transpose(0, 2, 1, 3)

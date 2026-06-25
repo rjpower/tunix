@@ -104,6 +104,28 @@ mega = [
   "marin-iris",
   "marin-fray",
 ]
+# Levanter SFT track: drive Levanter directly (ot_agent/levanter_sft.py ->
+# levanter.main.train_lm) for the OpenThoughts-Agent Qwen3 SFT, where Levanter's
+# fused CE (no [B,S,V] logit materialization) + O(seq) flash + sequence packing
+# fit Qwen3 at seq 32768 where our hand-rolled tunix path did not. Launch GPU SFT
+# jobs with `--extra gpu --extra levanter` (our `gpu` extra supplies
+# jax[cuda13]==0.10.0 + cu13 cuDNN 9.23). Mutually exclusive with `prod` (jax[tpu]).
+#
+# NB: deliberately NOT marin-levanter[gpu] -- that extra's GPU-kernel deps
+# (flash-attn-4, quack-kernels, torch-c-dlpack-ext) drag in torch, whose bundled
+# nvidia-cudnn-cu12 (9.10.2) shadows jax's cu13 cuDNN (9.23) at runtime and
+# crashes jaxlib's dnn init (RET_CHECK dnn_support, needs >=9.12). Without [gpu]
+# Levanter falls back to pure-jax blockwise FlashAttention (O(seq)) + XLA fused CE
+# -- correct and OOM-free at 32k, just not the Triton/FA4 kernels. Re-add [gpu]
+# for the throughput run once the cu12/cu13 cuDNN load order is sorted.
+levanter = [
+  "marin-levanter",
+  # HF safetensors export (save_pretrained) writes via fsspec; s3fs lets it target
+  # s3:// (R2) for the durable checkpoint handed to the RL phase. The tokenized
+  # cache + Levanter training checkpoints use tensorstore's built-in s3 driver and
+  # do NOT need s3fs; only the HF export path does.
+  "s3fs",
+]
 
 [project.urls]
 Source = "https://github.com/google/tunix"
@@ -140,6 +162,8 @@ prerelease = "allow"
 # both together. Submit TPU jobs with `--extra prod`, GPU jobs with `--extra gpu`.
 conflicts = [
   [{ extra = "prod" }, { extra = "gpu" }],
+  # marin-levanter[gpu] pins jax[cuda13]; incompatible with prod's jax[tpu].
+  [{ extra = "prod" }, { extra = "levanter" }],
 ]
 # google-tunix's pins and the marin nightly wheels disagree on a few transitive
 # deps; these overrides make the combined resolution converge. Mirrors the
@@ -151,6 +175,11 @@ override-dependencies = [
   "wheel>=0.46.2",
   "datasets>=3.1.0,<4.0.0",
   "equinox>=0.11.10",
+  # tunix's orbax-checkpoint>=0.12.0 needs tensorstore>=0.1.84; marin-levanter
+  # conservatively caps tensorstore<0.1.82. Lift the cap so both resolve in one
+  # lock — Levanter's tensorstore usage (zarr3 caches/checkpoints) is exercised
+  # by the levanter SFT smoke to confirm the newer tensorstore is compatible.
+  "tensorstore>=0.1.84",
 ]
 
 [build-system]
