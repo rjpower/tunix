@@ -207,6 +207,14 @@ def build_config() -> train_lm.TrainLmConfig:
     lr = float(_env("OTA_LR", str(PAPER_LR)))
     warmup = float(_env("OTA_WARMUP", str(PAPER_WARMUP)))
     hf_export = int(_env("OTA_HF_EXPORT", str(steps)))
+    # Export dtype. Levanter's HF save runs shard-by-shard, but the deshard
+    # (with_sharding_constraint(PartitionSpec())) replicates each shard, and a
+    # fp32 32B is 131GB on disk. bf16 halves host/HBM/disk and is a faithful RL
+    # seed (the released OpenThinkerAgent card is bf16; the fp32 master is only a
+    # training-time invariant). Crucially we must keep MEM at the schedulable
+    # 256GB default -- a >=1024GB reservation does not place on the shared cluster
+    # and the job hangs in `building`. Default bf16; override via OTA_HF_DTYPE.
+    hf_dtype = _env("OTA_HF_DTYPE", "bfloat16") or None
     # Checkpoint cadence (minutes). A 32B train state is hundreds of GB; the
     # Levanter default (15 min) would saturate R2 over a 12h run, so default to 2h.
     ckpt_minutes = int(_env("OTA_CKPT_MINUTES", "120"))
@@ -366,6 +374,7 @@ def build_config() -> train_lm.TrainLmConfig:
         pad_tokenizer_to_match_model=False,
         hf_save_path=f"{run_dir}/hf",
         hf_save_steps=hf_export,
+        hf_save_dtype=hf_dtype,
     )
 
 
