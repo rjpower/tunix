@@ -220,6 +220,14 @@ def build_config() -> train_lm.TrainLmConfig:
     ckpt_minutes = int(_env("OTA_CKPT_MINUTES", "120"))
     output = _env("OTA_OUTPUT", "s3://marin-na/users/power/ot-agent-levanter").rstrip("/")
     run = _env("OTA_RUN", os.environ.get("RUN_ID", "manual"))
+    # Resume after a preemption. Levanter keys the checkpoint dir by trainer.id
+    # ({run_dir}/checkpoints/<id>/step-N), and id defaults to the per-job RUN_ID, so
+    # a fresh job won't find the prior job's checkpoint. Setting OTA_RESUME_ID to the
+    # PRIOR job name pins trainer.id to that dir → discover_latest_checkpoint loads
+    # the latest COMPLETE checkpoint and training continues (initialize_from_hf /
+    # the warm-start patch is bypassed when a checkpoint exists). Keep OTA_OUTPUT,
+    # OTA_MODEL, OTA_DATASET, OTA_RUN identical to the prior job so run_dir matches.
+    resume_id = _env("OTA_RESUME_ID", "") or None
 
     if model_name == "8b":
         model, base_ckpt = _qwen3_8b(seq_len), "Qwen/Qwen3-8B"
@@ -298,6 +306,7 @@ def build_config() -> train_lm.TrainLmConfig:
 
     trainer = TrainerConfig(
         tracker=tracker,
+        id=resume_id,  # None for fresh runs (defaults to RUN_ID); set to resume
         mp=jmp.get_policy("p=f32,c=bfloat16"),  # bf16 compute, fp32 master/optimizer
         train_batch_size=batch,
         per_device_parallelism=pdp,
