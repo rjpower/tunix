@@ -91,6 +91,7 @@ def _qwen3_8b(seq_len: int) -> Qwen3Config:
         tie_word_embeddings=False,
         reference_checkpoint="Qwen/Qwen3-8B",
         rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0, factor=1.0),
+        **_attn_kwargs(),
     )
 
 
@@ -113,11 +114,33 @@ def _qwen3_32b_real(seq_len: int) -> Qwen3Config:
         tie_word_embeddings=False,
         reference_checkpoint="Qwen/Qwen3-32B",
         rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0, factor=1.0),
+        **_attn_kwargs(),
     )
 
 
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
+
+
+def _attn_kwargs() -> dict:
+    """Optional attention-backend overrides from env (diagnostic / fit knobs).
+
+    OTA_ATTN: one of nvte|splash|jax_flash|vanilla|default (Levanter AttentionBackend).
+      Unset => Levanter's GPU default (NVTE, which falls back to the pure-JAX blockwise
+      flash when transformer_engine is absent). Set jax_flash to force the O(seq)
+      blockwise FlashAttention-2 directly (skips the NVTE probe).
+    OTA_FLASH_BLOCK: flash block size (must divide seq_len); unset => kernel default 1024.
+    """
+    kw: dict = {}
+    ab = _env("OTA_ATTN", "").strip().lower()
+    if ab:
+        from levanter.layers.attention import AttentionBackend
+
+        kw["attn_backend"] = AttentionBackend(ab)
+    fb = _env("OTA_FLASH_BLOCK", "").strip()
+    if fb:
+        kw["flash_attention_block_size"] = int(fb)
+    return kw
 
 
 def build_config() -> train_lm.TrainLmConfig:
