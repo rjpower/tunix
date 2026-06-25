@@ -113,6 +113,18 @@ move MFU; both are substantial, separately-scoped changes.
   for node/process cleanup before resubmitting a multi-node job.
 - **iris workspace bundle ships committed git only** — uncommitted edits never
   reach the job; commit before every submit.
+- **Preemption is real on the shared cluster, and recovery works.** The first
+  attempt was preempted (`SIGTERM`, `preemption_notifier.cc`) at step 17 / ~4.3h,
+  mid-checkpoint — the cluster reclaimed the nodes. The periodic checkpoint +
+  export design held: the step-8 train-state checkpoint and step-11 bf16 export
+  survived in S3. Resume needs care: Levanter keys the checkpoint dir by
+  `trainer.id` (defaults to the per-job `RUN_ID`), so a fresh job won't auto-find
+  it — `OTA_RESUME_ID=<prior job name>` pins `trainer.id` so
+  `discover_latest_checkpoint` loads the latest *complete* checkpoint (it correctly
+  skipped the SIGTERM-interrupted step-16 and resumed from step-8). **Takeaway for
+  the RL phase:** any long run here must checkpoint frequently (we dropped to 30
+  min on resume) and be relaunchable by id — preemption is the norm, not the
+  exception, on a contended shared pool.
 
 ## What the 12h run delivers (job /power/ota-levanter-32b-1782367494)
 
