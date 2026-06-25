@@ -301,6 +301,13 @@ def build_config() -> train_lm.TrainLmConfig:
         max_grad_norm=1.0,
     )
 
+    logger.info(
+        "OTA config: model=%s seq=%d batch=%d pdp=%d tp=%d grad_ckpt=%r "
+        "param_map=%r compute_map=%r",
+        model_name, seq_len, batch, pdp, tp, getattr(model, "gradient_checkpointing", "<unset>"),
+        trainer.mesh.param_mapping, trainer.mesh.compute_mapping,
+    )
+
     return train_lm.TrainLmConfig(
         data=data,
         trainer=trainer,
@@ -320,6 +327,43 @@ def build_config() -> train_lm.TrainLmConfig:
         hf_save_path=f"{run_dir}/hf",
         hf_save_steps=hf_export,
     )
+
+
+def _start_mem_logger(period: float = 2.0) -> None:
+    """Daemon thread logging device HBM (in_use + peak) -- version-agnostic ground truth.
+
+    The OOM tip-over size is unreliable (BFC fails on the largest *contiguous* free
+    block, so fragmentation inflates it). Sampling jax memory_stats on a background
+    thread instead shows the real timeline: the plateau after trainer.initial_state
+    (= params + optimizer state base, the structural floor) vs the peak just before
+    the first-step OOM (= base + activations). That cleanly separates a param/opt
+    sharding problem from an activation problem. Gated by OTA_MEM_LOG (default on).
+    """
+    import threading
+    import time
+
+    def loop() -> None:
+        import jax
+
+        dev = jax.local_devices()[0]
+        hi = 0.0
+        while True:
+            try:
+                s = dev.memory_stats() or {}
+                inuse = s.get("bytes_in_use", 0) / 2**30
+                peak = s.get("peak_bytes_in_use", 0) / 2**30
+                limit = s.get("bytes_limit", 0) / 2**30
+                if peak > hi:
+                    hi = peak
+                    logger.info(
+                        "OTA mem[%s]: in_use=%.2fGiB peak=%.2fGiB limit=%.2fGiB",
+                        dev.id, inuse, peak, limit,
+                    )
+            except Exception as e:  # pragma: no cover -- diagnostic only
+                logger.info("OTA mem: stats unavailable (%r)", e)
+            time.sleep(period)
+
+    threading.Thread(target=loop, daemon=True, name="ota-mem-logger").start()
 
 
 def _patch_levanter_vocab_resize() -> None:
@@ -462,6 +506,8 @@ if __name__ == "__main__":
     # GPU "pallas" path on JAX 0.10 unrolls its vocab loop and materializes the full
     # [seq, V] logits (~40GiB) -> OOM; xla fori_loop-streams in ~1-2GB. Init-agnostic.
     _patch_fused_ce_force_xla()
+    if _env("OTA_MEM_LOG", "1") == "1":
+        _start_mem_logger()
     _init_from = _env("OTA_INIT_FROM", "").rstrip("/")
     if _init_from:
         _patch_load_pretrained_from_checkpoint(_init_from)
