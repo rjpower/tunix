@@ -206,10 +206,18 @@ def build_config() -> train_lm.TrainLmConfig:
         # the TP axis (kv_head=8 == model=8 for Qwen3-32B); o_proj/MLP already shard
         # via heads/mlp->model. Also map it in compute so the attention activations
         # shard (else they replicate -> the 50GB activation OOM). No-op at TP=1.
+        # vocab->model is the load-bearing one for the 32B fit: the lm_head/embedding
+        # carry the ``vocab`` axis, and the fused CE is built to be vocab-parallel
+        # (shard_map over the vocab/model axis). Leaving vocab unsharded forced the CE
+        # backward to materialize the FULL fp32 lm_head gradient (151672x5120 = ~3GB,
+        # seq-INDEPENDENT) on every device -> the persistent ~2.9GB OOM that no seq cut
+        # or MEM_FRACTION bump could touch. Mapping vocab->model shards that gradient AND
+        # the embedding/lm_head optimizer state over model=8 (rounded 151672 % 8 == 0;
+        # train_lm's round_axis_for_partitioning handles the rounding), freeing ~7GB.
         mesh=MeshConfig(
             axes={"replica": 1, "data": -1, "model": tp},
-            param_mapping={"embed": "data", "kv_head": "model"},
-            compute_mapping={"kv_head": "model"},
+            param_mapping={"embed": "data", "kv_head": "model", "vocab": "model"},
+            compute_mapping={"kv_head": "model", "vocab": "model"},
         ),
         allow_nondivisible_batch_size=True,
     )
@@ -303,6 +311,7 @@ def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
     import haliax
     import jax
     import levanter.compat.hf_checkpoints as hfc
+    from haliax.partitioning import round_axis_for_partitioning
     from levanter.checkpoint import discover_latest_checkpoint, load_checkpoint
 
     orig = hfc.HFCheckpointConverter.load_pretrained
@@ -315,7 +324,11 @@ def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
         # fall back to the HF arch if it ever passes None.
         if config is None:
             config = self.config_from_hf_config(self.hf_config_from_hf_checkpoint(ref))
-        Vocab = self.Vocab  # tokenizer vocab (151669) == the converted checkpoint's
+        # Round the vocab axis up to be divisible by its sharding (vocab->model=8 =>
+        # 151669 -> 151672), EXACTLY as train_lm does for the opt state it builds
+        # (round_axis_for_partitioning). The template, the opt state, and the converted
+        # checkpoint must all agree on 151672 or the swap/deserialize shape-mismatches.
+        Vocab = round_axis_for_partitioning(haliax.Axis("vocab", self.Vocab.size), axis_mapping)
         # export_hf_to_lm writes the model tree directly to ckpt_path (step=0, no
         # step-N subdir). discover_latest_checkpoint returns None if there's no
         # step-subdir layout, so fall back to the bare path. (latest_checkpoint_path

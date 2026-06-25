@@ -167,6 +167,19 @@ def convert(cfg: export_hf_to_lm.ImportHfConfig) -> None:
             dtype=dtype,
         )
 
+        # Round the vocab UP to the train run's TP so vocab can shard over model=TP.
+        # The SFT warm-starts at vocab->model=TP (the fix that makes Qwen3-32B@32k fit),
+        # and train_lm builds its model+opt state at round_axis_for_partitioning(vocab, TP)
+        # = round_up(151669, 8) = 151672. load_checkpoint matches arrays by shape, so the
+        # checkpoint we write here MUST be at that same 151672 (not the tokenizer's 151669).
+        # The extra rows are unused padding (the tokenizer never emits ids >= 151669).
+        train_tp = int(_env("OTA_TP", "8"))
+        cur_vocab = model.Vocab.size
+        rounded = ((cur_vocab + train_tp - 1) // train_tp) * train_tp
+        if rounded != cur_vocab:
+            logger.info("Rounding checkpoint vocab %d -> %d (train TP=%d)", cur_vocab, rounded, train_tp)
+            model = model.resize_vocab(rounded)
+
         _clean_stale_output(cfg.output_path)
         mkdirs(cfg.output_path)
         logger.info("Saving Levanter checkpoint (step=0) to %s", cfg.output_path)
