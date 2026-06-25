@@ -36,9 +36,13 @@ Env knobs (all optional; defaults give the 8B smoke):
   OTA_WARMUP    warmup fraction         (default 0.1, the paper's)
   OTA_HF_EXPORT hf_save_steps           (default = OTA_STEPS, i.e. export once)
   OTA_CKPT_MINUTES train-state ckpt cadence in minutes (default 120)
-  OTA_GRAD_CKPT nested|nestedN|N        -- scan remat policy; 'nested' (sqrt-N
-                                         multilevel remat) is REQUIRED to fit 32B@32k
+  OTA_GRAD_CKPT nested|offload|nested_offload|N -- scan remat policy override
                                          (see _grad_ckpt_kwargs). Unset => default True.
+  OTA_DATA_DCN  1                        -- put the FSDP ``data`` axis on the inter-node
+                                         (DCN) mesh axis so params+opt shard ACROSS nodes
+                                         (REQUIRED for multi-node 32B; else the nodes are
+                                         data-parallel replicas, opt state ~48GB/GPU,
+                                         32B@32k OOM). See the mesh comment in build_config.
   OTA_OUTPUT    fsspec output root      (default s3://marin-na/users/power/ot-agent-levanter)
   OTA_CACHE     tokenized-cache root    (default {OTA_OUTPUT}/cache; MUST be shared
                                          storage -- the cache build fans out to
@@ -168,8 +172,19 @@ def _grad_ckpt_kwargs() -> dict:
         return {}
     from haliax.nn.scan import ScanCheckpointPolicy
 
+    # The big seq-dependent activation is the [Layers, seq, Embed] residual-carry
+    # stack saved for the scan backward (Embed is replicated in compute -- it CAN'T
+    # be sharded there without corrupting the fused CE, which contracts over Embed
+    # with no cross-shard reduce). 'offload' parks that stack in host RAM (2TB/node)
+    # and streams it back per block in the backward -- the only carry-stack fix that
+    # leaves the CE and attention parallelism intact. Combine with 'nested' to also
+    # cut how many boundaries are saved at all.
     if v == "nested":
         gc: object = ScanCheckpointPolicy(nested=True)
+    elif v in ("offload", "offload_carries"):
+        gc = ScanCheckpointPolicy(save_carries="offload")
+    elif v in ("nested_offload", "offload_nested"):
+        gc = ScanCheckpointPolicy(nested=True, save_carries="offload")
     elif v.startswith("nested") and v[len("nested"):].isdigit():
         gc = ScanCheckpointPolicy(nested=int(v[len("nested"):]))
     elif v.isdigit():
@@ -177,7 +192,7 @@ def _grad_ckpt_kwargs() -> dict:
     elif v in ("true", "false"):
         gc = v == "true"
     else:
-        gc = v  # 'full'/'offload'/etc. -> ScanCheckpointPolicy.from_bool_or_str
+        gc = v  # 'full'/etc. -> ScanCheckpointPolicy.from_bool_or_str
     return {"gradient_checkpointing": gc}
 
 
@@ -246,6 +261,39 @@ def build_config() -> train_lm.TrainLmConfig:
     else:
         tracker = JsonLoggerConfig()
 
+    # Mesh topology. Levanter splits axes into ICI (within a slice == intra-node,
+    # NVLink) and DCN (across slices == inter-node, IB). ``axes`` are ICI; ``dcn_axes``
+    # are DCN. CRITICAL for multi-node 32B: with the naive
+    # ``axes={replica:1, data:-1, model:8}`` the 8 GPUs/node are entirely consumed by
+    # model=8, so the ICI ``data`` axis resolves to 1 and the 4 NODES default to
+    # ``replica_dcn=4`` -- i.e. 4 DATA-PARALLEL REPLICAS, each holding the full model
+    # sharded only 8-way over TP. The optimizer state is then ~384GB/8 = ~48GB/GPU
+    # (measured 46) and the 32B@32k step OOMs -- NOT an activation problem, a
+    # *sharding* problem: there is no FSDP across nodes.
+    #
+    # OTA_DATA_DCN=1 fixes it: put ``data`` on the DCN (inter-node) axis so params +
+    # optimizer shard 4-way ACROSS nodes (FSDP) while ``model``=8 stays intra-node TP.
+    # Net: 32-way sharding (data4 x model8), base ~14GB/GPU, leaving the card for
+    # activations. FSDP all-gathers params over IB per layer, overlapped with compute
+    # (CW H100 nodes have ~400GB/s IB, so it hides). Single-node (8B smoke) keeps the
+    # ICI ``data`` axis (data=8 intra-node FSDP) by leaving OTA_DATA_DCN unset.
+    data_dcn = _env("OTA_DATA_DCN", "0") == "1"
+    _param_map = {"embed": "data", "kv_head": "model", "vocab": "model"}
+    _compute_map = {"kv_head": "model"}
+    if data_dcn:
+        mesh_cfg = MeshConfig(
+            axes={"replica": 1, "model": tp},  # ICI: fill the node with TP
+            dcn_axes={"data": -1},  # DCN: shard params/opt across nodes (FSDP)
+            param_mapping=_param_map,
+            compute_mapping=_compute_map,
+        )
+    else:
+        mesh_cfg = MeshConfig(
+            axes={"replica": 1, "data": -1, "model": tp},
+            param_mapping=_param_map,
+            compute_mapping=_compute_map,
+        )
+
     trainer = TrainerConfig(
         tracker=tracker,
         mp=jmp.get_policy("p=f32,c=bfloat16"),  # bf16 compute, fp32 master/optimizer
@@ -284,11 +332,7 @@ def build_config() -> train_lm.TrainLmConfig:
         # already agree on 151672). The lm_head is gathered to full vocab for the
         # CE (~1.5GB bf16 transient) and the dW reduce-scattered back to the sharded
         # layout -- standard FSDP, cheap next to what Pallas streaming frees.
-        mesh=MeshConfig(
-            axes={"replica": 1, "data": -1, "model": tp},
-            param_mapping={"embed": "data", "kv_head": "model", "vocab": "model"},
-            compute_mapping={"kv_head": "model"},
-        ),
+        mesh=mesh_cfg,
         allow_nondivisible_batch_size=True,
     )
 
@@ -302,10 +346,12 @@ def build_config() -> train_lm.TrainLmConfig:
     )
 
     logger.info(
-        "OTA config: model=%s seq=%d batch=%d pdp=%d tp=%d grad_ckpt=%r "
-        "param_map=%r compute_map=%r",
-        model_name, seq_len, batch, pdp, tp, getattr(model, "gradient_checkpointing", "<unset>"),
-        trainer.mesh.param_mapping, trainer.mesh.compute_mapping,
+        "OTA config: model=%s seq=%d batch=%d pdp=%d tp=%d data_dcn=%s grad_ckpt=%r "
+        "ici_axes=%r dcn_axes=%r param_map=%r compute_map=%r",
+        model_name, seq_len, batch, pdp, tp, data_dcn,
+        getattr(model, "gradient_checkpointing", "<unset>"),
+        dict(mesh_cfg.axes), dict(mesh_cfg.dcn_axes),
+        mesh_cfg.param_mapping, mesh_cfg.compute_mapping,
     )
 
     return train_lm.TrainLmConfig(
