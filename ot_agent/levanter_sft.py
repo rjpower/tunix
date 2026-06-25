@@ -208,8 +208,8 @@ def build_config() -> train_lm.TrainLmConfig:
         # shard (else they replicate -> the 50GB activation OOM). No-op at TP=1.
         #
         # vocab->model is in param_mapping ONLY, NOT compute_mapping. The big-vocab
-        # CE cost is handled by the GPU streaming CE kernel (engaged with low-unroll
-        # block sizes via _patch_fused_ce_block_sizes), which tiles over vocab and
+        # CE cost is handled by the XLA streaming CE backend (pinned via
+        # _patch_fused_ce_force_xla), which fori_loop-streams over vocab blocks and
         # never materializes the [seq, 151672] logits. That kernel's shard_map
         # (levanter/models/loss.py) shards only the BATCH axis and keeps the FULL
         # vocab + hidden on each device -- it does NO cross-vocab-shard reduction.
@@ -297,61 +297,46 @@ def _patch_levanter_vocab_resize() -> None:
     hfc.HFCheckpointConverter.load_pretrained = patched
 
 
-def _patch_fused_ce_block_sizes(h_block: int = 16, v_block: int = 2048) -> None:
-    """Engage the GPU streaming CE kernel with block sizes that DON'T explode compile.
+def _patch_fused_ce_force_xla() -> None:
+    """Pin the fused CE to the XLA *streaming* backend -- the only one that fits 32B@32k.
 
-    THE 32B@32k FIT AND A SANE COMPILE BOTH HINGE ON THIS. Two coupled problems:
+    The CE over [seq=32768 tokens, vocab=151680] from a [seq, 5120] activation is
+    ~19.9GB of fp32 logits if ever materialized whole. Three kernel backends exist,
+    and on this stack (JAX 0.10, H100) only one is viable:
 
-    1. WRONG DEFAULT -> XLA fallback (the OOM). ``maybe_fused_next_token_loss`` calls
-       the kernel with ``block_size=None``, so it infers block sizes from a tuned
-       table that has NO bucket for Qwen3-32B's hidden=5120 (NVIDIA buckets cap at
-       h=4096). It returns ``BlockSizes.get_default()`` = (b=1024, h=512, v=1024); on
-       H100 the kernel's weight tile must fit ~101KB shared memory and 512*1024*2B =
-       1MB >> 101KB, so ``pallas_gpu`` rejects it and the CE falls back to the XLA
-       path -- which all-gathers the vocab and materializes the full [seq, 151672]
-       fp32 logits+grad (~38GiB) -> OOM.
+      * pallas_gpu (levanter's GPU default): JAX 0.10's Mosaic GPU can't lower the
+        tiled pallas_call dot_general, so pallas_gpu.py runs ``_fa_style_streaming`` --
+        a JAX function whose vocab loop is a PYTHON ``for`` over num_v_blocks. That
+        loop UNROLLS at trace time, so XLA schedules all tiles in PARALLEL and
+        materializes them at once (~= the full [seq, V] logits + its exp, ~40GiB,
+        INDEPENDENT of v_block) -> OOM at the first step. (Its custom_vjp backward is
+        fine; the unrolled forward is what blows up -- both memory and a ~20min compile
+        when v_block is small enough to dodge the shared-mem gate.)
+      * xla: forward is ``jax.lax.fori_loop`` over batch blocks, each calling
+        ``reference.linear_softmax_cross_entropy_loss_streaming`` which ``fori_loop``s
+        over VOCAB blocks -- both SEQUENTIAL, so only [b_block, v_block] (~1-2GB) is
+        ever live. A custom_vjp streams the backward the same way (saves just the LSE).
+        Truly O(block) memory AND a fast, no-unroll compile. This is the TPU default.
+      * reference: materializes the full logits; never use at this scale.
 
-    2. SMALL v_block -> giant unroll (the 20-min compile). On JAX 0.10 the GPU CE
-       forward is NOT a real Triton/Pallas kernel -- Mosaic GPU can't lower the tiled
-       pallas_call dot_general yet, so pallas_gpu.py runs ``_fa_style_streaming``, a
-       JAX function whose vocab loop is a PYTHON ``for`` over num_v_blocks =
-       ceil(V / v_block). That loop UNROLLS at trace time. The only int knob
-       (``block_size``) keeps h=512, so the largest gate-legal v is 64 ->
-       num_v_blocks = ceil(151680/64) = 2370 -> a ~20-minute HLO unroll (the backward
-       is already a lax.scan, but the forward unrolls).
-
-    The fix sets BOTH blocks via the kernel's ``infer_block_sizes_with_tuned_match``:
-    h_block=16 only PADS the hidden (5120 is already %16, and the streaming
-    dot_general contracts the FULL hidden, so h_block is otherwise inert), which lets
-    v_block rise to 2048 under the shared-mem gate (16*2048*2B = 64KB <= 101KB). That
-    drops num_v_blocks to ceil(151680/2048) = 75 -- a ~30x smaller forward unroll, so
-    the step compiles in a couple minutes. Returning has_tuned_match=True makes the
-    api use these directly (no autotune sweep), and the gate-legal tile keeps the CE
-    on ``pallas_gpu`` (no XLA fallback, no 38GiB logits). Patched at the kernel-api
-    level so ``block_size`` stays None and the model code is untouched.
+    levanter picks pallas_gpu on GPU, which OOMs for Qwen3-32B@32k, so we replace the
+    kernel api's ``_default_implementations`` (consulted whenever the model passes
+    ``implementation=None`` -- which ``maybe_fused_next_token_loss`` always does) to
+    return ``("xla",)``. The xla path infers its own block sizes (``infer_xla_*``), so
+    no block-size knob is needed; vocab stays unsharded in compute (param-only), so
+    there's no vocab all-gather. Net: CE peak drops from ~40GiB to ~1-2GB.
     """
     import levanter.kernels.pallas.fused_cross_entropy_loss.api as ce_api
-    from levanter.kernels.pallas.fused_cross_entropy_loss.config import BlockSizes
 
-    orig = ce_api.infer_block_sizes_with_tuned_match
-    if getattr(orig, "_ota_block_patched", False):
+    if getattr(ce_api._default_implementations, "_ota_xla_forced", False):
         return
 
-    tuned = BlockSizes(b_block_size=1024, h_block_size=h_block, v_block_size=v_block)
+    def _forced_xla():
+        return ("xla",)
 
-    def patched(b, h, v, *, dtype=None, x_dtype=None, w_dtype=None, device_kind=None):
-        # Only large-hidden (Qwen3-32B = 5120) lacks a tuned bucket and hits the
-        # oversized default; small models keep upstream's tuned choices.
-        if h > 3072:
-            return tuned, True
-        return orig(b, h, v, dtype=dtype, x_dtype=x_dtype, w_dtype=w_dtype, device_kind=device_kind)
-
-    patched._ota_block_patched = True
-    ce_api.infer_block_sizes_with_tuned_match = patched
-    logger.info(
-        "OTA: fused CE block sizes -> b=1024 h=%d v=%d (forward unroll ~= ceil(V/%d))",
-        h_block, v_block, v_block,
-    )
+    _forced_xla._ota_xla_forced = True
+    ce_api._default_implementations = _forced_xla
+    logger.info("OTA: forcing fused CE implementation -> xla (streaming fori_loop, fits 32B@32k)")
 
 
 def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
@@ -412,10 +397,10 @@ def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
 
 
 if __name__ == "__main__":
-    # Always engage the GPU streaming CE with low-unroll block sizes (see
-    # _patch_fused_ce_block_sizes): the XLA fallback OOMs at 32B@32k, and a too-small
-    # v_block makes the forward unroll explode the compile -- regardless of init path.
-    _patch_fused_ce_block_sizes(int(_env("OTA_CE_HBLOCK", "16")), int(_env("OTA_CE_VBLOCK", "2048")))
+    # Pin the CE to the XLA streaming backend (see _patch_fused_ce_force_xla): the
+    # GPU "pallas" path on JAX 0.10 unrolls its vocab loop and materializes the full
+    # [seq, V] logits (~40GiB) -> OOM; xla fori_loop-streams in ~1-2GB. Init-agnostic.
+    _patch_fused_ce_force_xla()
     _init_from = _env("OTA_INIT_FROM", "").rstrip("/")
     if _init_from:
         _patch_load_pretrained_from_checkpoint(_init_from)
