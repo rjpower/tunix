@@ -343,6 +343,18 @@ def _start_mem_logger(period: float = 2.0) -> None:
     import time
 
     def loop() -> None:
+        # Touching JAX (jax.local_devices) before jax.distributed.initialize() runs
+        # pre-inits the XLA backend and makes the main thread's distributed init
+        # raise. Wait until distributed init has set its client (cap at 180s so the
+        # single-process case, where it's never set, still proceeds).
+        from jax._src import distributed as _jd
+
+        for _ in range(180):
+            if getattr(_jd.global_state, "client", None) is not None:
+                break
+            time.sleep(1.0)
+        time.sleep(2.0)
+
         import jax
 
         dev = jax.local_devices()[0]
