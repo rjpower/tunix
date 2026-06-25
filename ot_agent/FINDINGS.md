@@ -142,16 +142,33 @@ HF export every 11 steps. Deliverables: validated 100K cache build, a partial-SF
 Qwen3-32B checkpoint (~2% of one epoch) as the RL-phase seed, and the throughput
 numbers above. Sizing chosen so the cosine schedule completes inside 12h.
 
-Confirmed live (job `/power/ota-levanter-32b-1782367494`): the 100K cache built in
-~15–20 min via Levanter's distributed "zephyr" tokenizer pool (10 shards); the
-**first train step on real 100K data completed in 821.3 s** (steady ~815–825 s/
-step — the ~1,286 tok/s model holds on the real corpus); loss decreasing
-(0.40 → 0.32 by step 10); the **2-hourly train-state checkpoint writes to S3**
-(resume de-risked); and the **bf16 HF export works end-to-end** — 14 safetensors
-shards of ~4.97 GB (= ~70 GB bf16; fp32 would be 28 shards / 131 GB), written
-shard-by-shard to S3 with no host OOM at the 256GB default. So the full
-**train → S3 checkpoint → bf16 HF export → RL seed** path is validated end-to-end.
-RL-seed location: `s3://marin-na/users/power/ot-agent-levanter/32b-openthoughts-agent-sft-100k-100k-12h/hf/<job>/step-<N>`.
+**COMPLETED** (initial run `/power/ota-levanter-32b-1782367494`, resumed after one
+preemption as `/power/ota-levanter-32b-1782386385`): the full **45/45-step cosine
+schedule finished within the 12h budget**. Timeline confirmed live: the 100K cache
+built in ~15–20 min via Levanter's distributed "zephyr" tokenizer pool (10 shards);
+the **first train step on real 100K data completed in 821.3 s** (steady ~815–825 s/
+step — the ~1,286 tok/s model held on the real corpus); **loss 0.40 → 0.249** (min at
+step 40) → **0.271 final** (step 45); train-state checkpoints wrote to S3 throughout
+(every ~30 min after resume — cadence dropped from 2h to de-risk re-preemption);
+and the **bf16 HF export works end-to-end** — 14 safetensors shards of ~4.97 GB
+(= ~70 GB bf16; fp32 would be 28 shards / 131 GB), written shard-by-shard to S3.
+So the full **train → S3 checkpoint → bf16 HF export → RL seed** path is validated
+end-to-end, *including* recovery from a mid-run preemption.
+
+Delivered artifacts (S3, under
+`s3://marin-na/users/power/ot-agent-levanter/32b-openthoughts-agent-sft-100k-100k-12h/`,
+trainer.id `ota-levanter-32b-1782367494`):
+- **RL seeds** (bf16 HF, 23 keys each = 14 shards + index/config/tokenizer):
+  `hf/ota-levanter-32b-1782367494/step-{11,22,33,44}`. **step-44 is the final**,
+  fully-decayed RL seed.
+- **Final train-state checkpoint** (Levanter retains only the latest complete one):
+  `checkpoints/ota-levanter-32b-1782367494/step-43` (149 keys). The step-16 partial
+  is the SIGTERM-interrupted remnant from the pre-resume preemption — `discover_
+  latest_checkpoint` correctly skips it (no completion marker).
+
+This is a **partial SFT** (~2% of one epoch — the 12h budget, not the paper's 5-epoch
+replication), serving as the validated RL-phase seed and the source of the throughput
+numbers above, not an accuracy reproduction of the paper's 44.8%.
 
 ## Suitability bottom line
 
