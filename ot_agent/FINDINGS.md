@@ -100,13 +100,20 @@ move MFU; both are substantial, separately-scoped changes.
 
 ## Operational gotchas (CW / iris / Levanter)
 
-- **`MEM ≥ ~1024GB` reservations do not schedule** on the shared cluster — the
-  job hangs in `building` indefinitely (observed: two 1h+ stalls). Keep MEM at
-  the 256GB default. (This is why the HF export must be bf16, below.)
+- **Host RAM: use `MEM=512GB`; `MEM ≥ ~1024GB` won't schedule.** The schedulable
+  ceiling on the shared pool is between 512GB (places in seconds) and 1024GB (hangs
+  in `building` indefinitely — observed two 1h+ stalls). 256GB is NOT enough for a
+  32B run that both checkpoints and HF-exports: a bf16 export *alone* fits 256GB,
+  but when a **train-state checkpoint write coincides with the HF export** (likely
+  under a frequent checkpoint cadence) the two host gathers stack and 256GB
+  **OOMkills** (`exit 137`, mid-`Saving shard`). 512GB has headroom for the
+  concurrent ckpt+export and still schedules — verified live (step-11 checkpoint
+  and 14-shard bf16 export completed together at 512GB).
 - **bf16 HF export.** Levanter's HF save is shard-by-shard (`~5GB/shard`), but
   fp32 32B is 131GB on disk and the per-shard deshard replicates; `hf_save_dtype=
-  bfloat16` halves host/HBM/disk and fits the 256GB default. A bf16 checkpoint is
-  a faithful RL seed (the fp32 master is a training-time invariant only).
+  bfloat16` halves host/HBM/disk (14 shards, ~65GB). A bf16 checkpoint is a
+  faithful RL seed (the fp32 master is a training-time invariant only). Still pair
+  it with `MEM=512GB` per above when checkpointing concurrently.
 - **Rapid kill→resubmit collides JAX coordinators.** Resubmitting ~30s after
   killing a job reuses a node still running the old JAX coordinator on :8476 →
   `wrong service incarnation` fatal on task 0 → world fails to form. Wait ~3 min
