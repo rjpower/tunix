@@ -1,4 +1,26 @@
-# ot_agent — Qwen3-32B SFT for OpenThoughts-Agent, on 32× H100 (tunix)
+# ot_agent — Qwen3-32B SFT for OpenThoughts-Agent, on 32× H100
+
+> ## ⚠️ STATUS — read `FINDINGS.md` first
+>
+> **The live SFT path is Levanter, not tunix.** tunix could not train Qwen3-32B
+> at the paper's seq 32768 on GPU (TPU-only flash kernel + full-vocab `[B,S,V]`
+> fp32 loss tensors → OOM), so the working pipeline is
+> **`levanter_sft.py` + `submit_levanter_sft.sh`** (marin-levanter, JAX 0.10).
+> tunix remains the **RL** target; the SFT→RL bridge is an HF-safetensors export.
+>
+> **Headline result (`FINDINGS.md`):** the 32B@32k SFT is *feasible but not
+> performant* on 4 nodes. The OOM that looked like activations was actually a
+> **multi-node FSDP sharding** bug (the model was data-parallel-replicated across
+> nodes, only TP-sharded) — fixed by sharding the FSDP weight axis over the DCN
+> axis (`OTA_DATA_DCN=1`), base 46 → 11.6 GiB/GPU. But throughput is **~1,286
+> tok/s (~0.7% MFU)** → the paper's 5-epoch / 100K replication is **~3 months** on
+> these nodes; the authorized 12h trains **~2% of one epoch** (a pipeline + scale
+> validation and a partial RL-seed checkpoint, not a replication).
+>
+> The sections below document the **earlier tunix exploration** and the shared
+> assets (data sharding, HF-export roundtrip, chat template) that the Levanter
+> path still reuses. Where a verdict below says "tunix does 32B SFT," read it as
+> superseded by `FINDINGS.md`.
 
 Replicate the SFT stage of **OpenThoughts-Agent** (arXiv:2606.24855): fine-tune
 `Qwen/Qwen3-32B` on the released 100K agent-trajectory set and (later) an RL pass
