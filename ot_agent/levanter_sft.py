@@ -206,18 +206,27 @@ def build_config() -> train_lm.TrainLmConfig:
         # the TP axis (kv_head=8 == model=8 for Qwen3-32B); o_proj/MLP already shard
         # via heads/mlp->model. Also map it in compute so the attention activations
         # shard (else they replicate -> the 50GB activation OOM). No-op at TP=1.
-        # vocab->model is the load-bearing one for the 32B fit: the lm_head/embedding
-        # carry the ``vocab`` axis, and the fused CE is built to be vocab-parallel
-        # (shard_map over the vocab/model axis). Leaving vocab unsharded forced the CE
-        # backward to materialize the FULL fp32 lm_head gradient (151672x5120 = ~3GB,
-        # seq-INDEPENDENT) on every device -> the persistent ~2.9GB OOM that no seq cut
-        # or MEM_FRACTION bump could touch. Mapping vocab->model shards that gradient AND
-        # the embedding/lm_head optimizer state over model=8 (rounded 151672 % 8 == 0;
-        # train_lm's round_axis_for_partitioning handles the rounding), freeing ~7GB.
+        #
+        # vocab->model is in param_mapping ONLY, NOT compute_mapping. The big-vocab
+        # CE cost is handled by the fused Pallas GPU streaming kernel (engaged via
+        # _patch_fused_ce_block_size -> block_size=64), which tiles over vocab and
+        # never materializes the [seq, 151672] logits. That kernel's shard_map
+        # (levanter/models/loss.py) shards only the BATCH axis and keeps the FULL
+        # vocab + hidden on each device -- it does NO cross-vocab-shard reduction.
+        # So putting vocab->model in *compute* gives each shard a partial,
+        # incorrect softmax and forces an all-gather of the vocab -> the XLA
+        # fallback materializes the full [seq, 151672] fp32 logits (~38GiB) -> OOM.
+        # Keeping vocab out of compute makes the CE correct and lets Pallas stream.
+        # Keeping vocab->model in *param* still shards the lm_head/embedding param,
+        # gradient, and Adam optimizer state over model=8 (rounded 151672 % 8 == 0;
+        # train_lm's round_axis_for_partitioning + the converted checkpoint both
+        # already agree on 151672). The lm_head is gathered to full vocab for the
+        # CE (~1.5GB bf16 transient) and the dW reduce-scattered back to the sharded
+        # layout -- standard FSDP, cheap next to what Pallas streaming frees.
         mesh=MeshConfig(
             axes={"replica": 1, "data": -1, "model": tp},
             param_mapping={"embed": "data", "kv_head": "model", "vocab": "model"},
-            compute_mapping={"kv_head": "model", "vocab": "model"},
+            compute_mapping={"kv_head": "model"},
         ),
         allow_nondivisible_batch_size=True,
     )
@@ -288,6 +297,46 @@ def _patch_levanter_vocab_resize() -> None:
     hfc.HFCheckpointConverter.load_pretrained = patched
 
 
+def _patch_fused_ce_block_size(v_block: int = 64) -> None:
+    """Force the fused cross-entropy onto the Pallas GPU *streaming* kernel.
+
+    THE 32B@32k FIT HINGES ON THIS. Without it, the loss silently falls back to
+    the XLA path, which all-gathers the vocab and materializes the full
+    ``[seq, 151672]`` fp32 logits + gradient (~38GiB) on one device -> OOM. The
+    Pallas GPU kernel instead tiles over the vocab and never materializes them.
+
+    Why the fallback happens by default: ``maybe_fused_next_token_loss`` is called
+    with ``block_size=None``, so the kernel infers block sizes from a tuned table
+    (``tuned_block_sizes.py``). That table has NO shape bucket for Qwen3-32B's
+    hidden=5120 (its NVIDIA buckets cap at h=4096 "llama3-ish" / h<=3072), so it
+    returns ``BlockSizes.get_default()`` = (b=1024, h=512, v=1024). On H100 the
+    Pallas weight tile must fit ~101KB of shared memory: 512*1024*2B = 1MB >> 101KB,
+    so ``pallas_gpu`` raises PallasUnsupportedError and the kernel falls back to XLA.
+
+    The fix: pass an explicit ``block_size`` (= the kernel's ``v_block_size``),
+    which both *bypasses* the broken inference AND keeps the default h=512:
+    512 * 64 * 2B = 64KB < 101KB -> the tile fits and ``pallas_gpu`` (the default
+    first-choice impl on GPU) runs. v_block=64 is the largest power of two that
+    fits with h=512 (v=128 -> 128KB > budget). ``compute_next_token_loss`` doesn't
+    thread a block_size and ``TrainLmConfig`` exposes no knob, so we inject it by
+    wrapping ``maybe_fused_next_token_loss`` where the model imported it
+    (``lm_model``); Qwen3 inherits that base ``compute_next_token_loss`` unchanged.
+    """
+    import levanter.models.lm_model as lmm
+
+    orig = lmm.maybe_fused_next_token_loss
+    if getattr(orig, "_ota_block_patched", False):
+        return
+
+    def patched(*args, **kwargs):
+        kwargs.setdefault("block_size", v_block)
+        return orig(*args, **kwargs)
+
+    patched._ota_block_patched = True
+    lmm.maybe_fused_next_token_loss = patched
+    logger.info("OTA: forcing fused CE onto Pallas GPU streaming kernel (block_size=%d)", v_block)
+
+
 def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
     """Warm-start 32B from a pre-converted Levanter checkpoint, gently.
 
@@ -346,6 +395,9 @@ def _patch_load_pretrained_from_checkpoint(ckpt_path: str) -> None:
 
 
 if __name__ == "__main__":
+    # Always engage the Pallas GPU streaming CE (see _patch_fused_ce_block_size):
+    # the XLA fallback OOMs at 32B@32k regardless of warm-start vs fresh-HF init.
+    _patch_fused_ce_block_size(int(_env("OTA_CE_VBLOCK", "64")))
     _init_from = _env("OTA_INIT_FROM", "").rstrip("/")
     if _init_from:
         _patch_load_pretrained_from_checkpoint(_init_from)
