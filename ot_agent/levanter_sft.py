@@ -36,6 +36,9 @@ Env knobs (all optional; defaults give the 8B smoke):
   OTA_WARMUP    warmup fraction         (default 0.1, the paper's)
   OTA_HF_EXPORT hf_save_steps           (default = OTA_STEPS, i.e. export once)
   OTA_CKPT_MINUTES train-state ckpt cadence in minutes (default 120)
+  OTA_GRAD_CKPT nested|nestedN|N        -- scan remat policy; 'nested' (sqrt-N
+                                         multilevel remat) is REQUIRED to fit 32B@32k
+                                         (see _grad_ckpt_kwargs). Unset => default True.
   OTA_OUTPUT    fsspec output root      (default s3://marin-na/users/power/ot-agent-levanter)
   OTA_CACHE     tokenized-cache root    (default {OTA_OUTPUT}/cache; MUST be shared
                                          storage -- the cache build fans out to
@@ -92,6 +95,7 @@ def _qwen3_8b(seq_len: int) -> Qwen3Config:
         reference_checkpoint="Qwen/Qwen3-8B",
         rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0, factor=1.0),
         **_attn_kwargs(),
+        **_grad_ckpt_kwargs(),
     )
 
 
@@ -115,6 +119,7 @@ def _qwen3_32b_real(seq_len: int) -> Qwen3Config:
         reference_checkpoint="Qwen/Qwen3-32B",
         rope=DefaultRotaryEmbeddingsConfig(theta=1000000.0, factor=1.0),
         **_attn_kwargs(),
+        **_grad_ckpt_kwargs(),
     )
 
 
@@ -141,6 +146,39 @@ def _attn_kwargs() -> dict:
     if fb:
         kw["flash_attention_block_size"] = int(fb)
     return kw
+
+
+def _grad_ckpt_kwargs() -> dict:
+    """gradient_checkpointing override from env (OTA_GRAD_CKPT) -- the 32B@32k fix.
+
+    With scan-over-layers, Levanter's default (gradient_checkpointing=True) saves the
+    output carry of every one of the 64 Qwen3-32B layers: a [Layers=64, seq, hidden]
+    stack whose fp32 backward cotangent is 64*32768*5120*4 == ~43GB at seq 32768 --
+    THE 32B@32k first-step OOM (~40GiB), independent of the (already-streamed) CE.
+
+    'nested' => haliax ScanCheckpointPolicy(nested=True): multilevel/sqrt(N) remat.
+    It reshapes the 64-layer stack into [B, 64/B] and saves only the B~=sqrt(64)=8
+    outer-block boundaries, recomputing the rest in the backward -- ~8x less activation
+    memory for ~20% more compute. 'nestedN' or a bare int N pins the outer block count.
+    Unset => leave the config default (True). Also accepts true/false/full/offload
+    passthrough for completeness.
+    """
+    v = _env("OTA_GRAD_CKPT", "").strip().lower()
+    if not v:
+        return {}
+    from haliax.nn.scan import ScanCheckpointPolicy
+
+    if v == "nested":
+        gc: object = ScanCheckpointPolicy(nested=True)
+    elif v.startswith("nested") and v[len("nested"):].isdigit():
+        gc = ScanCheckpointPolicy(nested=int(v[len("nested"):]))
+    elif v.isdigit():
+        gc = ScanCheckpointPolicy(nested=int(v))
+    elif v in ("true", "false"):
+        gc = v == "true"
+    else:
+        gc = v  # 'full'/'offload'/etc. -> ScanCheckpointPolicy.from_bool_or_str
+    return {"gradient_checkpointing": gc}
 
 
 def build_config() -> train_lm.TrainLmConfig:
