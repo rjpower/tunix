@@ -262,37 +262,31 @@ def build_config() -> train_lm.TrainLmConfig:
         tracker = JsonLoggerConfig()
 
     # Mesh topology. Levanter splits axes into ICI (within a slice == intra-node,
-    # NVLink) and DCN (across slices == inter-node, IB). ``axes`` are ICI; ``dcn_axes``
-    # are DCN. CRITICAL for multi-node 32B: with the naive
-    # ``axes={replica:1, data:-1, model:8}`` the 8 GPUs/node are entirely consumed by
-    # model=8, so the ICI ``data`` axis resolves to 1 and the 4 NODES default to
-    # ``replica_dcn=4`` -- i.e. 4 DATA-PARALLEL REPLICAS, each holding the full model
-    # sharded only 8-way over TP. The optimizer state is then ~384GB/8 = ~48GB/GPU
-    # (measured 46) and the 32B@32k step OOMs -- NOT an activation problem, a
-    # *sharding* problem: there is no FSDP across nodes.
+    # NVLink) and DCN (across slices == inter-node, IB). The default mesh has
+    # ICI={data:-1, replica:1, model:1} and DCN={replica_dcn:-1}. CRITICAL for
+    # multi-node 32B: with ``model=8`` the 8 GPUs/node are entirely consumed by TP, so
+    # the ICI ``data`` axis resolves to 1 and the 4 NODES become ``replica_dcn=4`` --
+    # i.e. 4 DATA-PARALLEL REPLICAS, each holding the full model sharded only 8-way
+    # over TP. The optimizer state is then ~384GB/8 = ~48GB/GPU (measured 46) and the
+    # 32B@32k step OOMs -- NOT an activation problem, a *sharding* problem: no FSDP
+    # across nodes. (data can't simply be moved to dcn_axes: axis_shapes re-injects the
+    # default ICI data:-1, so 'data' would collide in both ICI and DCN.)
     #
-    # OTA_DATA_DCN=1 fixes it: put ``data`` on the DCN (inter-node) axis so params +
-    # optimizer shard 4-way ACROSS nodes (FSDP) while ``model``=8 stays intra-node TP.
-    # Net: 32-way sharding (data4 x model8), base ~14GB/GPU, leaving the card for
-    # activations. FSDP all-gathers params over IB per layer, overlapped with compute
-    # (CW H100 nodes have ~400GB/s IB, so it hides). Single-node (8B smoke) keeps the
-    # ICI ``data`` axis (data=8 intra-node FSDP) by leaving OTA_DATA_DCN unset.
+    # OTA_DATA_DCN=1 fixes it by sharding the FSDP weight axes over BOTH ``data`` (ICI,
+    # intra-node) AND ``replica_dcn`` (DCN, inter-node). With model=8 -> data=1 and
+    # replica_dcn=4, so embed shards 4-way ACROSS nodes (ZeRO-3 FSDP) while model=8
+    # stays intra-node TP: 32-way total, base ~14GB/GPU. ``replica_dcn`` is already in
+    # the batch's DEFAULT_DP_AXES, so activations data-parallelise over it too. Works
+    # for single-node (replica_dcn=1 -> a no-op, plain data=8 intra-node FSDP).
     data_dcn = _env("OTA_DATA_DCN", "0") == "1"
-    _param_map = {"embed": "data", "kv_head": "model", "vocab": "model"}
+    _fsdp = ["data", "replica_dcn"] if data_dcn else "data"
+    _param_map = {"embed": _fsdp, "kv_head": "model", "vocab": "model"}
     _compute_map = {"kv_head": "model"}
-    if data_dcn:
-        mesh_cfg = MeshConfig(
-            axes={"replica": 1, "model": tp},  # ICI: fill the node with TP
-            dcn_axes={"data": -1},  # DCN: shard params/opt across nodes (FSDP)
-            param_mapping=_param_map,
-            compute_mapping=_compute_map,
-        )
-    else:
-        mesh_cfg = MeshConfig(
-            axes={"replica": 1, "data": -1, "model": tp},
-            param_mapping=_param_map,
-            compute_mapping=_compute_map,
-        )
+    mesh_cfg = MeshConfig(
+        axes={"replica": 1, "data": -1, "model": tp},
+        param_mapping=_param_map,
+        compute_mapping=_compute_map,
+    )
 
     trainer = TrainerConfig(
         tracker=tracker,
